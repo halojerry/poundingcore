@@ -558,9 +558,14 @@ impl TeamAgentProvisioner {
             session_mode,
         );
         let provider_id = if agent_type == AgentType::Aionrs {
-            self.resolve_provider_for_model(model)
-                .await
-                .unwrap_or_else(|| backend.to_owned())
+            let resolved = self.resolve_provider_for_model(model).await;
+            if resolved.is_some() {
+                resolved.unwrap()
+            } else {
+                self.fallback_provider_id()
+                    .await
+                    .unwrap_or_else(|| backend.to_owned())
+            }
         } else {
             backend.to_owned()
         };
@@ -709,6 +714,15 @@ impl TeamAgentProvisioner {
             }
         }
         None
+    }
+
+    /// Returns the first enabled provider ID as a fallback when
+    /// `resolve_provider_for_model` cannot match the model to any provider.
+    /// This prevents "Provider 'aionrs' not found" errors when the
+    /// managed provider has models that don't match the agent's model name.
+    async fn fallback_provider_id(&self) -> Option<String> {
+        let providers = self.provider_repo.list().await.ok()?;
+        providers.into_iter().find(|p| p.enabled).map(|p| p.id)
     }
 }
 
