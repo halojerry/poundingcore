@@ -113,17 +113,15 @@ pub trait IMockAgent: IAgentTask {
     async fn get_model(&self) -> Result<GetModelInfoResponse, AgentError> {
         Ok(GetModelInfoResponse { model_info: None })
     }
-    async fn set_mode(&self, _mode: &str) -> Result<(), AgentError> {
-        Err(AgentError::bad_request("Mode switching is not supported for this mock"))
+    async fn get_config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
+        Ok(GetConfigOptionsResponse {
+            config_options: Vec::new(),
+        })
     }
-    async fn set_model(&self, _model_id: &str) -> Result<(), AgentError> {
+    async fn set_config_option(&self, _option_id: &str, _value: &str) -> Result<SetConfigOptionResponse, AgentError> {
         Err(AgentError::bad_request(
-            "Model switching is not supported for this mock",
+            "Config option switching is not supported for this mock",
         ))
-    }
-    async fn set_model_confirmed(&self, model_id: &str) -> Result<GetModelInfoResponse, AgentError> {
-        self.set_model(model_id).await?;
-        self.get_model().await
     }
     async fn get_usage(&self) -> Result<Option<serde_json::Value>, AgentError> {
         Ok(None)
@@ -136,16 +134,6 @@ pub trait IMockAgent: IAgentTask {
             status: "unsupported".into(),
             answer: None,
         })
-    }
-    async fn get_config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
-        Ok(GetConfigOptionsResponse {
-            config_options: Vec::new(),
-        })
-    }
-    async fn set_config_option(&self, _option_id: &str, _value: &str) -> Result<SetConfigOptionResponse, AgentError> {
-        Err(AgentError::bad_request(
-            "Config option switching is not supported for this mock",
-        ))
     }
 }
 
@@ -162,6 +150,10 @@ pub trait IMockAgent: IAgentTask {
 pub enum AgentInstance {
     Acp(Arc<AcpAgentManager>),
     Aionrs(Arc<AionrsAgentManager>),
+    /// clean-slate direct-CLI session model (claude/codex only). Wraps an
+    /// `aionui_session::SessionBackend` via [`SessionAgentTask`]. Every other
+    /// backend keeps the `Acp` path. See the session-model-port design doc.
+    Session(Arc<crate::session_agent::SessionAgentTask>),
     /// Test-only trait-object escape hatch used by downstream crates
     /// (conversation/cron/team/app tests) to inject fake agents without
     /// spinning up a real CLI or WebSocket connection. Gated behind
@@ -181,6 +173,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.as_ref(),
             Self::Aionrs(m) => m.as_ref(),
+            Self::Session(m) => m.as_ref(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.as_ref(),
         }
@@ -246,6 +239,12 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.kill_and_wait(reason),
             Self::Aionrs(m) => m.kill_and_wait(reason),
+            // Session teardown is Drop-driven (dropping the last SessionBackend
+            // handle aborts its reader + reaps the child). Nothing to await here.
+            Self::Session(m) => {
+                let _ = m.kill(reason);
+                Box::pin(std::future::ready(()))
+            }
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => {
                 let _ = m.kill(reason);
@@ -269,6 +268,9 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.get_confirmations(),
             Self::Aionrs(m) => m.get_confirmations(),
+            // Session permissions surface as AcpPermission stream events + are
+            // answered via confirm(); no separate cached-confirmation list yet.
+            Self::Session(m) => m.get_confirmations(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_confirmations(),
         }
@@ -285,6 +287,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.confirm(msg_id, call_id, data, always_allow),
             Self::Aionrs(m) => m.confirm(msg_id, call_id, data, always_allow),
+            Self::Session(m) => m.confirm(msg_id, call_id, data, always_allow),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.confirm(msg_id, call_id, data, always_allow),
         }
@@ -295,6 +298,8 @@ impl AgentInstance {
         match self {
             Self::Acp(_) => false,
             Self::Aionrs(m) => m.check_approval(action, command_type),
+            // Session (claude/codex) has no aionrs-style auto-approve list.
+            Self::Session(_) => false,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.check_approval(action, command_type),
         }
@@ -303,7 +308,7 @@ impl AgentInstance {
     /// Session key for test doubles that expose one.
     pub fn get_session_key(&self) -> Option<String> {
         match self {
-            Self::Acp(_) | Self::Aionrs(_) => None,
+            Self::Acp(_) | Self::Aionrs(_) | Self::Session(_) => None,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_session_key(),
         }
@@ -314,6 +319,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.mode().await,
             Self::Aionrs(m) => m.mode().await,
+            Self::Session(m) => m.mode().await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.mode().await,
         }
@@ -327,7 +333,7 @@ impl AgentInstance {
             Self::Acp(m) => {
                 let sdk_model = m.model().await;
                 let sdk_info = sdk_model.map(map_sdk_model_to_payload);
-                let cc_switch_info = if m.is_managed_backend() {
+                let cc_switch_info = if m.is_claude_backend() {
                     crate::cc_switch::read_claude_model_info()
                 } else {
                     None
@@ -336,53 +342,35 @@ impl AgentInstance {
                 Ok(GetModelInfoResponse { model_info })
             }
             Self::Aionrs(_) => Ok(GetModelInfoResponse { model_info: None }),
+            Self::Session(m) => m.get_model().await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_model().await,
         }
     }
 
-    /// Switch the active model. Unsupported for variants other than ACP —
-    /// returns a `BadRequest` so the caller can surface an actionable
-    /// error rather than silently no-op.
-    pub async fn set_mode(&self, mode: &str) -> Result<(), AgentError> {
+    pub async fn get_config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
         match self {
-            Self::Acp(m) => m.set_mode(mode).await,
-            Self::Aionrs(m) => m.set_mode(mode).await,
+            Self::Acp(m) => m.config_options().await,
+            Self::Aionrs(m) => m.config_options().await,
+            Self::Session(m) => m.get_config_options().await,
             #[cfg(any(test, feature = "test-support"))]
-            Self::Mock(m) => m.set_mode(mode).await,
+            Self::Mock(m) => m.get_config_options().await,
         }
     }
 
-    pub async fn set_model(&self, model_id: &str) -> Result<(), AgentError> {
-        if model_id.trim().is_empty() {
-            return Err(AgentError::bad_request("model_id must not be empty"));
+    pub async fn set_config_option(&self, option_id: &str, value: &str) -> Result<SetConfigOptionResponse, AgentError> {
+        if option_id.trim().is_empty() {
+            return Err(AgentError::bad_request("option_id must not be empty"));
+        }
+        if value.trim().is_empty() {
+            return Err(AgentError::bad_request("value must not be empty"));
         }
         match self {
-            Self::Acp(m) => m.set_model(model_id).await,
-            Self::Aionrs(_) => Err(AgentError::bad_request(
-                "Model switching is not supported for this agent type",
-            )),
+            Self::Acp(m) => m.set_config_option_confirmed(option_id, value).await,
+            Self::Aionrs(m) => m.set_config_option(option_id, value).await,
+            Self::Session(m) => m.set_config_option(option_id, value).await,
             #[cfg(any(test, feature = "test-support"))]
-            Self::Mock(m) => m.set_model(model_id).await,
-        }
-    }
-
-    /// Switch the active model and return the confirmed model payload for
-    /// this specific mutation, rather than re-reading potentially stale
-    /// cached state.
-    pub async fn set_model_confirmed(&self, model_id: &str) -> Result<GetModelInfoResponse, AgentError> {
-        if model_id.trim().is_empty() {
-            return Err(AgentError::bad_request("model_id must not be empty"));
-        }
-        match self {
-            Self::Acp(m) => Ok(GetModelInfoResponse {
-                model_info: Some(map_sdk_model_to_payload(m.set_model_confirmed(model_id).await?)),
-            }),
-            Self::Aionrs(_) => Err(AgentError::bad_request(
-                "Model switching is not supported for this agent type",
-            )),
-            #[cfg(any(test, feature = "test-support"))]
-            Self::Mock(m) => m.set_model_confirmed(model_id).await,
+            Self::Mock(m) => m.set_config_option(option_id, value).await,
         }
     }
 
@@ -404,6 +392,7 @@ impl AgentInstance {
                 Ok(Some(value))
             }
             Self::Aionrs(_) => Ok(None),
+            Self::Session(m) => m.get_usage().await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_usage().await,
         }
@@ -416,6 +405,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.load_slash_commands().await,
             Self::Aionrs(m) => m.get_slash_commands().await,
+            Self::Session(m) => m.get_slash_commands().await,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_slash_commands().await,
         }
@@ -446,32 +436,12 @@ impl AgentInstance {
                 status: "unsupported".into(),
                 answer: None,
             }),
+            Self::Session(_) => Ok(SideQuestionResponse {
+                status: "unsupported".into(),
+                answer: None,
+            }),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.handle_side_question(req).await,
-        }
-    }
-
-    pub async fn get_config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
-        match self {
-            Self::Acp(m) => m.config_options().await,
-            Self::Aionrs(m) => m.config_options().await,
-            #[cfg(any(test, feature = "test-support"))]
-            Self::Mock(m) => m.get_config_options().await,
-        }
-    }
-
-    pub async fn set_config_option(&self, option_id: &str, value: &str) -> Result<SetConfigOptionResponse, AgentError> {
-        if option_id.trim().is_empty() {
-            return Err(AgentError::bad_request("option_id must not be empty"));
-        }
-        if value.trim().is_empty() {
-            return Err(AgentError::bad_request("value must not be empty"));
-        }
-        match self {
-            Self::Acp(m) => m.set_config_option_confirmed(option_id, value).await,
-            Self::Aionrs(m) => m.set_config_option(option_id, value).await,
-            #[cfg(any(test, feature = "test-support"))]
-            Self::Mock(m) => m.set_config_option(option_id, value).await,
         }
     }
 }

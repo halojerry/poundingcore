@@ -13,19 +13,11 @@ use aionui_api_types::{SessionMcpServer, SessionMcpTransport};
 use aionui_common::CommandSpec;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
-use aionui_mcp::{
-    AcpMcpCapabilities, AcpSessionMcpServer, ImageGenConfig, build_builtin_image_gen_server, parse_acp_mcp_capabilities,
-};
-use aionui_runtime::{
-    ManagedAcpToolId, NativeCliToolId, ensure_managed_acp_tool_with_reporter, ensure_native_cli_tool_with_reporter,
-    ensure_node_runtime_with_reporter, ensure_runtime_command, ensure_runtime_command_with_reporter,
-    resolve_command_path,
-};
+use aionui_mcp::{AcpMcpCapabilities, AcpSessionMcpServer, ImageGenConfig, build_builtin_image_gen_server, parse_acp_mcp_capabilities};
+use aionui_runtime::{ensure_runtime_command, ensure_runtime_command_with_reporter};
 use tracing::{debug, info, warn};
 
-use crate::runtime_status::{
-    conversation_acp_tool_runtime_reporter, conversation_native_cli_reporter, conversation_runtime_reporter,
-};
+use crate::runtime_status::conversation_runtime_reporter;
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
@@ -55,14 +47,62 @@ pub(super) async fn build(
         config.backend.clone_from(&meta.backend);
     }
 
-    let mut command_spec = resolve_agent_command_spec(
-        &meta,
-        &ctx.workspace,
-        &ctx.conversation_id,
-        deps.broadcaster.clone(),
-        &deps.data_dir,
-    )
-    .await?;
+    // Session-model port: claude/codex ALWAYS run through the clean-slate direct-CLI
+    // SessionBackend (SessionAgentTask), NOT the ACP manager. Every other ACP vendor
+    // keeps the AcpAgentManager path below. There is no fallback: a claude/codex
+    // build that yields no instance is a hard error, not a silent drop to ACP. The
+    // build inputs mirror clean-slate `build_runtime` 1:1 (resume anchor, mode/model
+    // precedence, MCP + preset + skills init surface, cc-switch env, codex sandbox/approval).
+    if let Some(backend_label) = config.backend.as_deref()
+        && matches!(backend_label, "claude" | "codex")
+    {
+        let instance = crate::session_agent::build_session_instance(
+            backend_label,
+            crate::session_agent::SessionBuildInputs {
+                conversation_id: ctx.conversation_id.clone(),
+                workspace: ctx.workspace.clone(),
+                config: &config,
+                metadata: &meta,
+                session_snapshot: build_context.session_snapshot.as_ref(),
+                backend_session_id: build_context.session_id.clone(),
+                mcp_server_repo: deps.mcp_server_repo.as_ref(),
+                // The AIONUI_* conversation runtime context the legacy path
+                // injects via apply_acp_launch_policy — forwarded into
+                // SessionConfig.spawn_env so direct-CLI spawns get it too.
+                runtime_env: &ctx.runtime_env,
+                broadcaster: deps.broadcaster.clone(),
+                // G5: keyed by the resolved catalog row so the discovered
+                // modes/models/commands refresh the `/api/agents` picker (the
+                // AcpAgentManager path does this via CatalogForwarder; the session
+                // path polls capabilities() directly since its stream carries no
+                // catalog events).
+                catalog_writeback: Some((meta.id.clone(), deps.agent_registry.catalog_sender())),
+                // Persist the resume anchor + observed mode/model from the session
+                // pump (the ACP path does this via acp_agent_service.attach, which
+                // this early-return bypasses).
+                acp_session_repo: Some(deps.acp_agent_service.repo()),
+                // DEV (`--dump-prompts`): resolve the dump dir once (mirrors the
+                // aionrs factory's `prompt_dump_dir`). `None` when off.
+                prompt_dump_dir: crate::dev_prompt_dump::dump_dir_for_data_dir(&deps.data_dir, deps.dump_prompts),
+            },
+            deps.session_spawner.clone(),
+        )
+        .await?
+        .ok_or_else(|| {
+            AgentError::internal(format!(
+                "session backend for '{backend_label}' unexpectedly returned no instance"
+            ))
+        })?;
+        tracing::info!(
+            conversation_id = %ctx.conversation_id,
+            backend = %backend_label,
+            "session-port: routing conversation through the direct-CLI SessionAgentTask (not AcpAgentManager)"
+        );
+        return Ok(instance);
+    }
+
+    let mut command_spec =
+        resolve_agent_command_spec(&meta, &ctx.workspace, &ctx.conversation_id, deps.broadcaster.clone()).await?;
     apply_acp_launch_policy(
         &mut command_spec,
         AcpLaunchPolicyInput {
@@ -162,31 +202,13 @@ pub(super) async fn build(
         }
     }
 
-    // ── Builtin MCP servers ───────────────────────────────────────────
-    // Chrome DevTools MCP — always available for stdio-capable agents.
-    if mcp_capabilities.stdio {
-        match ensure_stdio_launch("npx", &["-y".to_owned(), "chrome-devtools-mcp@latest".to_owned()], &[]).await {
-            Ok((command, args, env)) => {
-                session_mcp_servers.push(McpServer::Stdio(
-                    McpServerStdio::new("chrome-devtools".to_owned(), command)
-                        .args(args)
-                        .env(env),
-                ));
-            }
-            Err(e) => {
-                warn!(ctx.conversation_id, error = %e, "builtin_mcp: chrome-devtools unavailable; skipping");
-            }
-        }
-    }
-
-    // ── Image Generation MCP ───────────────────────────────────────────
+    // ── POUNDING: Image Generation MCP ───────────────────────────────────
     // Injected when API credentials are available from the cc-switch
     // provider config or fallback defaults.
     //
     // The image-gen MCP server script (builtin-mcp-image-gen.js) is
     // compiled from AionUi/packages/desktop/src/process/resources/builtinMcp/imageGenServer.ts
-    // and bundled alongside the backend binary. When the script is
-    // materialized to the data dir, pass its path in args.
+    // and bundled alongside the backend binary.
     if mcp_capabilities.stdio {
         let cc_env = crate::cc_switch::read_claude_provider_env();
         let api_key = cc_env
@@ -301,24 +323,7 @@ async fn resolve_agent_command_spec(
     workspace: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
-    data_dir: &std::path::Path,
 ) -> Result<CommandSpec, AgentError> {
-    if meta.agent_source == aionui_api_types::AgentSource::Builtin
-        && let Some(backend) = meta.backend.as_deref()
-        && let Some(tool) = ManagedAcpToolId::from_backend(backend)
-    {
-        return resolve_builtin_managed_acp_command_spec(meta, workspace, conversation_id, broadcaster, tool).await;
-    }
-
-    if meta.agent_source == aionui_api_types::AgentSource::Builtin
-        && meta.command.is_none()
-        && let Some(backend) = meta.backend.as_deref()
-        && let Some(tool) = NativeCliToolId::from_backend(backend)
-    {
-        return resolve_builtin_native_cli_command_spec(meta, workspace, conversation_id, broadcaster, tool, data_dir)
-            .await;
-    }
-
     let command = meta
         .command
         .as_deref()
@@ -366,192 +371,6 @@ async fn resolve_agent_command_spec(
     })
 }
 
-async fn resolve_builtin_managed_acp_command_spec(
-    meta: &aionui_api_types::AgentMetadata,
-    workspace: &str,
-    conversation_id: &str,
-    broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
-    tool: ManagedAcpToolId,
-) -> Result<CommandSpec, AgentError> {
-    // In bundled mode, the primary binary is installed from bundled resources
-    // during tool activation; skip the PATH check when bundled artifacts exist.
-    let skip_path_check = aionui_runtime::requires_bundled_resources()
-        && aionui_runtime::bundled_root_candidate().is_some_and(|root| {
-            let acp_dir = root.join("acp").join(tool.slug()).join(tool.version());
-            acp_dir.is_dir()
-                && std::fs::read_dir(&acp_dir)
-                    .map(|mut entries| entries.any(|e| e.map(|entry| entry.path().is_dir()).unwrap_or(false)))
-                    .unwrap_or(false)
-        });
-    if !skip_path_check
-        && let Some(primary) = meta.agent_source_info.binary_name.as_deref()
-        && resolve_command_path(primary).is_none()
-    {
-        return Err(AgentError::bad_request(format!(
-            "Agent '{}' requires `{primary}` to be installed and available on PATH",
-            meta.name
-        )));
-    }
-
-    let node_reporter = conversation_runtime_reporter(broadcaster.clone(), conversation_id.to_owned());
-    let node_runtime = ensure_node_runtime_with_reporter(Some(node_reporter.as_ref()))
-        .await
-        .map_err(|error| AgentError::bad_request(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
-
-    let tool_reporter = conversation_acp_tool_runtime_reporter(broadcaster, conversation_id.to_owned(), tool);
-    let managed_tool = ensure_managed_acp_tool_with_reporter(tool, Some(tool_reporter.as_ref()))
-        .await
-        .map_err(|error| AgentError::bad_request(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
-
-    let resolved = managed_tool.command(&node_runtime);
-
-    let args: Vec<String> = resolved
-        .args_prefix
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-
-    let mut env: Vec<aionui_common::EnvVar> = meta
-        .env
-        .iter()
-        .map(|entry| aionui_common::EnvVar {
-            name: entry.name.clone(),
-            value: entry.value.clone(),
-        })
-        .collect();
-    env.extend(resolved.env.iter().map(|(name, value)| aionui_common::EnvVar {
-        name: name.to_string_lossy().into_owned(),
-        value: value.to_string_lossy().into_owned(),
-    }));
-
-    Ok(CommandSpec {
-        command: resolved.program,
-        args,
-        env,
-        cwd: Some(workspace.to_owned()),
-    })
-}
-
-async fn resolve_builtin_native_cli_command_spec(
-    meta: &aionui_api_types::AgentMetadata,
-    workspace: &str,
-    conversation_id: &str,
-    broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
-    tool: NativeCliToolId,
-    data_dir: &std::path::Path,
-) -> Result<CommandSpec, AgentError> {
-    let node_runtime = if tool.runtime_kind() == aionui_runtime::NativeCliRuntimeKind::Node {
-        let node_reporter = conversation_runtime_reporter(broadcaster.clone(), conversation_id.to_owned());
-        let nr = ensure_node_runtime_with_reporter(Some(node_reporter.as_ref()))
-            .await
-            .map_err(|error| AgentError::bad_request(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
-        Some(nr)
-    } else {
-        None
-    };
-
-    let tool_reporter = conversation_native_cli_reporter(broadcaster, conversation_id.to_owned(), tool);
-    let managed_tool = ensure_native_cli_tool_with_reporter(tool, Some(tool_reporter.as_ref()))
-        .await
-        .map_err(|error| AgentError::bad_request(format!("Agent '{}' CLI unavailable: {error}", meta.name)))?;
-
-    let resolved = managed_tool.command(node_runtime.as_ref());
-
-    let mut args: Vec<String> = resolved
-        .args_prefix
-        .iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    args.extend(meta.args.iter().cloned());
-
-    let mut env: Vec<aionui_common::EnvVar> = meta
-        .env
-        .iter()
-        .map(|entry| aionui_common::EnvVar {
-            name: entry.name.clone(),
-            value: entry.value.clone(),
-        })
-        .collect();
-    env.extend(resolved.env.iter().map(|(name, value)| aionui_common::EnvVar {
-        name: name.to_string_lossy().into_owned(),
-        value: value.to_string_lossy().into_owned(),
-    }));
-
-    if tool == NativeCliToolId::OpenCode {
-        let opencode_config_path = data_dir.join("managed-opencode").join("opencode.json");
-        env.push(aionui_common::EnvVar {
-            name: "OPENCODE_CONFIG".to_owned(),
-            value: opencode_config_path.to_string_lossy().into_owned(),
-        });
-        let xdg_config_home = data_dir.join("xdg-config");
-        env.push(aionui_common::EnvVar {
-            name: "XDG_CONFIG_HOME".to_owned(),
-            value: xdg_config_home.to_string_lossy().into_owned(),
-        });
-    }
-
-    if tool == NativeCliToolId::OpenClaw {
-        if let Ok(home) = std::env::var("HOME") {
-            let openclaw_home = std::path::PathBuf::from(&home).join(".openclaw");
-            env.push(aionui_common::EnvVar {
-                name: "OPENCLAW_HOME".to_owned(),
-                value: openclaw_home.to_string_lossy().into_owned(),
-            });
-            // Read gateway token from openclaw.json for ACP bridge authentication
-            let config_path = openclaw_home.join("openclaw.json");
-            match std::fs::read_to_string(&config_path) {
-                Ok(config_bytes) => match serde_json::from_str::<serde_json::Value>(&config_bytes) {
-                    Ok(config) => {
-                        if let Some(token) = config["gateway"]["auth"]["token"].as_str() {
-                            env.push(aionui_common::EnvVar {
-                                name: "OPENCLAW_GATEWAY_TOKEN".to_owned(),
-                                value: token.to_owned(),
-                            });
-                            info!(
-                                "OpenClaw config loaded: gateway token found, home={}",
-                                openclaw_home.display()
-                            );
-                        } else {
-                            warn!(
-                                "OpenClaw config missing gateway.auth.token at {} — run POUNDING login to regenerate",
-                                config_path.display()
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            %e,
-                            path = %config_path.display(),
-                            "Failed to parse openclaw.json — file may be corrupt; delete it and re-login to regenerate"
-                        );
-                    }
-                },
-                Err(e) => {
-                    warn!(
-                        %e,
-                        path = %config_path.display(),
-                        "openclaw.json not found — OpenClaw config has not been provisioned; log in with NewAPI account first"
-                    );
-                }
-            }
-        }
-        // Point ACP subprocess at the existing gateway
-        let gateway_url = "ws://127.0.0.1:18789";
-        env.push(aionui_common::EnvVar {
-            name: "OPENCLAW_GATEWAY_URL".to_owned(),
-            value: gateway_url.to_owned(),
-        });
-        info!(gateway_url, "OpenClaw ACP subprocess configured");
-    }
-
-    Ok(CommandSpec {
-        command: resolved.program,
-        args,
-        env,
-        cwd: Some(workspace.to_owned()),
-    })
-}
-
 /// Load the operator's enabled MCP servers from the DB, log+skip any rows
 /// whose `transport_config` JSON fails to parse (better to start without one
 /// MCP tool than fail the whole session), and return them in SDK shape ready
@@ -588,7 +407,7 @@ async fn load_user_mcp_servers(
         let selected = selected_ids
             .map(|ids| ids.iter().any(|id| id == &row.id))
             .unwrap_or(row.enabled);
-        if !selected {
+        if !selected || row.builtin {
             continue;
         }
         if !row_supported_by_capabilities(&row, capabilities) {
@@ -910,7 +729,7 @@ mod tests {
     #[cfg(unix)]
     impl BundledRuntimeModeGuard {
         fn install(root: &Path) -> Self {
-            unsafe { std::env::set_var("POUNDING_BUNDLED_MANAGED_RESOURCES", root) };
+            unsafe { std::env::set_var("AIONUI_BUNDLED_MANAGED_RESOURCES", root) };
             set_managed_resources_mode(ManagedResourcesMode::Bundled);
             Self
         }
@@ -919,7 +738,7 @@ mod tests {
     #[cfg(unix)]
     impl Drop for BundledRuntimeModeGuard {
         fn drop(&mut self) {
-            unsafe { std::env::remove_var("POUNDING_BUNDLED_MANAGED_RESOURCES") };
+            unsafe { std::env::remove_var("AIONUI_BUNDLED_MANAGED_RESOURCES") };
             set_managed_resources_mode(ManagedResourcesMode::Download);
         }
     }
@@ -1006,7 +825,6 @@ mod tests {
             "/tmp/workspace",
             "conv-acp",
             Arc::new(BroadcastEventBus::new(16)),
-            test_runtime_data_dir(),
         )
         .await
         .expect("resolved command spec");
@@ -1178,7 +996,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_user_mcp_servers_skips_disabled_loads_builtin() {
+    async fn load_user_mcp_servers_skips_disabled_and_builtin() {
         let stdio_config = stdio_config_for_existing_command();
         let caps = AcpMcpCapabilities {
             stdio: true,
@@ -1189,25 +1007,22 @@ mod tests {
             rows: vec![
                 make_row("user-enabled", "stdio", &stdio_config, true, false),
                 make_row("user-disabled", "stdio", &stdio_config, false, false),
-                make_row("builtin-enabled", "stdio", &stdio_config, true, true),
-                make_row("builtin-disabled", "stdio", &stdio_config, false, true),
+                make_row(
+                    "builtin",
+                    "stdio",
+                    r#"{"command":"img-gen","args":[],"env":{}}"#,
+                    true,
+                    true,
+                ),
             ],
             fail: false,
         });
         let servers = load_user_mcp_servers(repo.as_ref(), None, "conv-1", &caps).await;
-        // user-enabled + builtin-enabled (both enabled, builtin no longer
-        // unconditionally skipped). user-disabled and builtin-disabled are
-        // skipped because they are not enabled.
-        assert_eq!(servers.len(), 2);
-        let names: Vec<&str> = servers
-            .iter()
-            .map(|s| match s {
-                McpServer::Stdio(s) => s.name.as_str(),
-                _ => "",
-            })
-            .collect();
-        assert!(names.contains(&"user-enabled"));
-        assert!(names.contains(&"builtin-enabled"));
+        assert_eq!(servers.len(), 1);
+        match &servers[0] {
+            McpServer::Stdio(s) => assert_eq!(s.name, "user-enabled"),
+            _ => panic!("expected stdio"),
+        }
     }
 
     #[tokio::test]

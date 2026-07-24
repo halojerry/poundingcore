@@ -1,16 +1,13 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    EnsureManagedAcpToolResponse, EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind,
-    RuntimeStatusPayload, RuntimeStatusPhase, RuntimeStatusScope, WebSocketMessage,
+    EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload, RuntimeStatusPhase,
+    RuntimeStatusScope, WebSocketMessage,
 };
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{
-    ManagedAcpToolFailureKind, ManagedAcpToolId, ManagedAcpToolProgress, ManagedAcpToolProgressPhase,
-    NativeCliFailureKind, NativeCliProgress, NativeCliProgressPhase, NativeCliToolId, NodeRuntimeFailureKind,
-    NodeRuntimeProgress, NodeRuntimeProgressPhase, SharedManagedAcpToolProgressReporter,
-    SharedNativeCliProgressReporter, SharedNodeRuntimeProgressReporter, ensure_managed_acp_tool_with_reporter,
-    ensure_native_cli_tool_with_reporter, ensure_node_runtime_with_reporter,
+    NodeRuntimeFailureKind, NodeRuntimeProgress, NodeRuntimeProgressPhase, SharedNodeRuntimeProgressReporter,
+    ensure_node_runtime_with_reporter,
 };
 
 use crate::error::SystemError;
@@ -36,35 +33,6 @@ impl RuntimePrepareService {
         Ok(EnsureNodeRuntimeResponse { ready: true })
     }
 
-    pub async fn ensure_managed_acp_tool(
-        &self,
-        scope: RuntimeStatusScope,
-        tool_id: &str,
-    ) -> Result<EnsureManagedAcpToolResponse, SystemError> {
-        let tool = ManagedAcpToolId::from_slug(tool_id)
-            .ok_or_else(|| SystemError::BadRequest(format!("Unsupported managed ACP tool '{tool_id}'")))?;
-        let node_reporter = self.node_runtime_reporter(scope.clone());
-        ensure_node_runtime_with_reporter(Some(node_reporter.as_ref()))
-            .await
-            .map_err(|error| SystemError::BadRequest(error.to_string()))?;
-
-        let tool_reporter = self.acp_tool_runtime_reporter(scope, tool);
-        ensure_managed_acp_tool_with_reporter(tool, Some(tool_reporter.as_ref()))
-            .await
-            .map_err(|error| SystemError::BadRequest(error.to_string()))?;
-        Ok(EnsureManagedAcpToolResponse { ready: true })
-    }
-
-    pub async fn ensure_native_cli_tool(&self, scope: RuntimeStatusScope, tool_id: &str) -> Result<(), SystemError> {
-        let tool = NativeCliToolId::from_slug(tool_id)
-            .ok_or_else(|| SystemError::BadRequest(format!("Unsupported native CLI tool '{tool_id}'")))?;
-        let reporter = self.native_cli_reporter(scope, tool);
-        ensure_native_cli_tool_with_reporter(tool, Some(reporter.as_ref()))
-            .await
-            .map_err(|error| SystemError::BadRequest(error.to_string()))?;
-        Ok(())
-    }
-
     fn node_runtime_reporter(&self, scope: RuntimeStatusScope) -> SharedNodeRuntimeProgressReporter {
         let broadcaster = self.broadcaster.clone();
         Arc::new(move |update: NodeRuntimeProgress| {
@@ -74,44 +42,6 @@ impl RuntimePrepareService {
                 scope: scope.clone(),
                 phase: map_phase(update.phase),
                 failure_kind: update.failure_kind.map(map_failure_kind),
-                message: update.message,
-                status_code: update.status_code,
-            };
-            let payload = serde_json::to_value(payload).expect("runtime status payload should serialize");
-            broadcaster.broadcast(WebSocketMessage::new("runtime.statusChanged", payload));
-        })
-    }
-
-    fn acp_tool_runtime_reporter(
-        &self,
-        scope: RuntimeStatusScope,
-        tool: ManagedAcpToolId,
-    ) -> SharedManagedAcpToolProgressReporter {
-        let broadcaster = self.broadcaster.clone();
-        Arc::new(move |update: ManagedAcpToolProgress| {
-            let payload = RuntimeStatusPayload {
-                resource: RuntimeResourceKind::AcpTool,
-                resource_id: Some(tool.slug().to_owned()),
-                scope: scope.clone(),
-                phase: map_acp_phase(update.phase),
-                failure_kind: update.failure_kind.map(map_acp_failure_kind),
-                message: update.message,
-                status_code: update.status_code,
-            };
-            let payload = serde_json::to_value(payload).expect("runtime status payload should serialize");
-            broadcaster.broadcast(WebSocketMessage::new("runtime.statusChanged", payload));
-        })
-    }
-
-    fn native_cli_reporter(&self, scope: RuntimeStatusScope, tool: NativeCliToolId) -> SharedNativeCliProgressReporter {
-        let broadcaster = self.broadcaster.clone();
-        Arc::new(move |update: NativeCliProgress| {
-            let payload = RuntimeStatusPayload {
-                resource: RuntimeResourceKind::NativeCli,
-                resource_id: Some(tool.slug().to_owned()),
-                scope: scope.clone(),
-                phase: map_native_cli_phase(update.phase),
-                failure_kind: update.failure_kind.map(map_native_cli_failure_kind),
                 message: update.message,
                 status_code: update.status_code,
             };
@@ -143,57 +73,5 @@ fn map_failure_kind(kind: NodeRuntimeFailureKind) -> RuntimeFailureKind {
         NodeRuntimeFailureKind::BundledResourceMissing => RuntimeFailureKind::BundledResourceMissing,
         NodeRuntimeFailureKind::BundledResourceInvalid => RuntimeFailureKind::BundledResourceInvalid,
         NodeRuntimeFailureKind::Unknown => RuntimeFailureKind::Unknown,
-    }
-}
-
-fn map_acp_phase(phase: ManagedAcpToolProgressPhase) -> RuntimeStatusPhase {
-    match phase {
-        ManagedAcpToolProgressPhase::WaitingForLock => RuntimeStatusPhase::WaitingForLock,
-        ManagedAcpToolProgressPhase::Downloading => RuntimeStatusPhase::Downloading,
-        ManagedAcpToolProgressPhase::Extracting => RuntimeStatusPhase::Extracting,
-        ManagedAcpToolProgressPhase::Validating => RuntimeStatusPhase::Validating,
-        ManagedAcpToolProgressPhase::Ready => RuntimeStatusPhase::Ready,
-        ManagedAcpToolProgressPhase::Failed => RuntimeStatusPhase::Failed,
-    }
-}
-
-fn map_acp_failure_kind(kind: ManagedAcpToolFailureKind) -> RuntimeFailureKind {
-    match kind {
-        ManagedAcpToolFailureKind::Timeout => RuntimeFailureKind::Timeout,
-        ManagedAcpToolFailureKind::DownloadFailed => RuntimeFailureKind::DownloadFailed,
-        ManagedAcpToolFailureKind::HttpStatus => RuntimeFailureKind::HttpStatus,
-        ManagedAcpToolFailureKind::ChecksumMismatch => RuntimeFailureKind::ChecksumMismatch,
-        ManagedAcpToolFailureKind::ValidationFailed => RuntimeFailureKind::ValidationFailed,
-        ManagedAcpToolFailureKind::UnsupportedPlatform => RuntimeFailureKind::UnsupportedPlatform,
-        ManagedAcpToolFailureKind::BundledResourceMissing => RuntimeFailureKind::BundledResourceMissing,
-        ManagedAcpToolFailureKind::BundledResourceInvalid => RuntimeFailureKind::BundledResourceInvalid,
-        ManagedAcpToolFailureKind::Unknown => RuntimeFailureKind::Unknown,
-    }
-}
-
-// NOTE: These two mapping functions are intentionally duplicated with
-// `aionui-ai-agent::runtime_status`. See the matching comment there.
-fn map_native_cli_phase(phase: NativeCliProgressPhase) -> RuntimeStatusPhase {
-    match phase {
-        NativeCliProgressPhase::WaitingForLock => RuntimeStatusPhase::WaitingForLock,
-        NativeCliProgressPhase::Downloading => RuntimeStatusPhase::Downloading,
-        NativeCliProgressPhase::Extracting => RuntimeStatusPhase::Extracting,
-        NativeCliProgressPhase::Validating => RuntimeStatusPhase::Validating,
-        NativeCliProgressPhase::Ready => RuntimeStatusPhase::Ready,
-        NativeCliProgressPhase::Failed => RuntimeStatusPhase::Failed,
-    }
-}
-
-fn map_native_cli_failure_kind(kind: NativeCliFailureKind) -> RuntimeFailureKind {
-    match kind {
-        NativeCliFailureKind::Timeout => RuntimeFailureKind::Timeout,
-        NativeCliFailureKind::DownloadFailed => RuntimeFailureKind::DownloadFailed,
-        NativeCliFailureKind::HttpStatus => RuntimeFailureKind::HttpStatus,
-        NativeCliFailureKind::ChecksumMismatch => RuntimeFailureKind::ChecksumMismatch,
-        NativeCliFailureKind::ValidationFailed => RuntimeFailureKind::ValidationFailed,
-        NativeCliFailureKind::UnsupportedPlatform => RuntimeFailureKind::UnsupportedPlatform,
-        NativeCliFailureKind::BundledResourceMissing => RuntimeFailureKind::BundledResourceMissing,
-        NativeCliFailureKind::BundledResourceInvalid => RuntimeFailureKind::BundledResourceInvalid,
-        NativeCliFailureKind::Unknown => RuntimeFailureKind::Unknown,
     }
 }

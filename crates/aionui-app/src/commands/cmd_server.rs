@@ -19,6 +19,7 @@ use crate::bootstrap::{BootstrapError, BootstrapErrorCode, ParentExitSignal, Ser
 
 const LISTENING_EVENT_PREFIX: &str = "POUNDINGCORE_LISTENING";
 const DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS: usize = 50;
+const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownReason {
@@ -231,51 +232,24 @@ pub(crate) async fn run_server(
     info!(elapsed_ms = boot.elapsed().as_millis(), "Server listening on {addr}");
 
     let runtime_prepare_service = RuntimePrepareService::new(services.event_bus.clone());
-    let agent_registry = services.agent_registry.clone();
     tokio::spawn(async move {
         let scope = RuntimeStatusScope {
-            kind: RuntimeStatusScopeKind::Onboarding,
+            kind: RuntimeStatusScopeKind::CustomAgent,
             id: "startup".into(),
         };
         let prepare_started = Instant::now();
         info!("startup: managed runtime background preparation started");
         let result = async {
-            let mut errors: Vec<String> = Vec::new();
-            if let Err(e) = runtime_prepare_service.ensure_node_runtime(scope.clone()).await {
-                errors.push(e.to_string());
-            }
-            if let Err(e) = runtime_prepare_service
-                .ensure_managed_acp_tool(scope.clone(), "codex-acp")
-                .await
-            {
-                errors.push(e.to_string());
-            }
-            if let Err(e) = runtime_prepare_service
-                .ensure_managed_acp_tool(scope.clone(), "claude-agent-acp")
-                .await
-            {
-                errors.push(e.to_string());
-            }
-            // Native CLI tools (hermes, opencode, openclaw) are installed
-            // by the frontend's installManagedCliBatch via pip/npm/bun.
-            // Backend `which` detection finds them on PATH after install.
-            if errors.is_empty() {
-                Ok(())
-            } else {
-                Err(errors.join("; "))
-            }
+            runtime_prepare_service.ensure_node_runtime(scope).await?;
+            Ok::<(), aionui_system::SystemError>(())
         }
         .await;
 
         match result {
-            Ok(()) => {
-                info!(
-                    prepare_elapsed_ms = prepare_started.elapsed().as_millis(),
-                    "startup: managed runtime background preparation completed"
-                );
-                agent_registry.refresh_availability().await;
-                info!("startup: agent registry availability refreshed after managed runtime preparation");
-            }
+            Ok(()) => info!(
+                prepare_elapsed_ms = prepare_started.elapsed().as_millis(),
+                "startup: managed runtime background preparation completed"
+            ),
             Err(error) => warn!(
                 code = "BOOTSTRAP_DEGRADED_MANAGED_RUNTIME_PREPARE",
                 stage = "runtime.prepare",
@@ -335,13 +309,11 @@ pub(crate) async fn run_server(
                         reason = "graceful_shutdown",
                         active_turn_count, "conversation runtime shutdown prepared"
                     );
-                    worker_task_manager.clear();
-                    // Give spawned kill tasks a brief window to terminate
-                    // child CLI processes (ACP_KILL_GRACE_MS + margin).
-                    // The timeout is intentionally short — we don't block
-                    // shutdown, but we let the runtime drain the kill tasks
-                    // spawned by agent.kill(None).
-                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    let active_task_count = worker_task_manager.active_count();
+                    match tokio::time::timeout(WORKER_TASK_SHUTDOWN_TIMEOUT, worker_task_manager.clear()).await {
+                        Ok(()) => info!(active_task_count, "worker task manager shutdown completed"),
+                        Err(_) => warn!(active_task_count, "worker task manager shutdown timed out"),
+                    }
                 }
             }
             if let Err(error) = client_pref_service.release_keep_awake_for_shutdown().await {

@@ -21,7 +21,7 @@ pub struct ManagedResourceSource {
     pub root: PathBuf,
 }
 
-const BUNDLED_RESOURCES_ENV: &str = "POUNDING_BUNDLED_MANAGED_RESOURCES";
+const BUNDLED_RESOURCES_ENV: &str = "AIONUI_BUNDLED_MANAGED_RESOURCES";
 
 pub fn set_managed_resources_mode(mode: ManagedResourcesMode) {
     *mode_lock().write().expect("managed resources mode lock poisoned") = mode;
@@ -54,15 +54,27 @@ pub fn node_sources(directory_name: &str) -> Vec<ManagedResourceSource> {
         .collect()
 }
 
-pub fn acp_tool_sources(tool_slug: &str, version: &str, platform_key: &str) -> Vec<ManagedResourceSource> {
+pub fn cli_sources(name: &str, version: &str, target: &str) -> Vec<ManagedResourceSource> {
     resource_roots()
         .into_iter()
         .map(|source| ManagedResourceSource {
-            root: source.root.join("acp").join(tool_slug).join(version).join(platform_key),
+            root: source.root.join("cli").join(name).join(version).join(target),
             ..source
         })
         .filter(|source| source.root.is_dir())
         .collect()
+}
+
+pub fn export_cli_to_root(
+    root: &Path,
+    source_root: &Path,
+    name: &str,
+    version: &str,
+    target: &str,
+) -> std::io::Result<PathBuf> {
+    let target_dir = root.join("cli").join(name).join(version).join(target);
+    materialize_directory(source_root, &target_dir)?;
+    Ok(target_dir)
 }
 
 pub fn export_node_runtime_to_root(root: &Path, source_root: &Path, directory_name: &str) -> std::io::Result<PathBuf> {
@@ -143,16 +155,21 @@ pub fn materialize_directory(source_root: &Path, target_root: &Path) -> std::io:
 
 fn resource_roots() -> Vec<ManagedResourceSource> {
     let mut roots = Vec::new();
-    // Always include bundled root if available, regardless of mode.
-    // Download mode also needs bundled resources for offline-first behavior.
-    if let Some(root) = bundled_root()
-        && root.is_dir()
-    {
-        roots.push(ManagedResourceSource {
-            kind: ManagedResourceSourceKind::Bundled,
-            root,
-        });
+
+    match managed_resources_mode() {
+        ManagedResourcesMode::Bundled => {
+            if let Some(root) = bundled_root()
+                && root.is_dir()
+            {
+                roots.push(ManagedResourceSource {
+                    kind: ManagedResourceSourceKind::Bundled,
+                    root,
+                });
+            }
+        }
+        ManagedResourcesMode::Download => {}
     }
+
     roots
 }
 
@@ -249,11 +266,39 @@ mod tests {
     }
 
     #[test]
-    fn download_mode_includes_bundled_root_when_configured() {
+    fn cli_sources_targets_cli_subtree_in_bundled_mode() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("managed");
         if !crate::test_support::run_in_env_child(
-            "managed_resources::tests::download_mode_includes_bundled_root_when_configured",
+            "managed_resources::tests::cli_sources_targets_cli_subtree_in_bundled_mode",
+            |command| {
+                command.env(BUNDLED_RESOURCES_ENV, &root);
+            },
+        ) {
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(BUNDLED_RESOURCES_ENV).expect("bundled root env"));
+        let expected = root.join("cli").join("claude").join("2.1.215").join("darwin-arm64");
+        fs::create_dir_all(&expected).expect("create cli dir");
+
+        set_managed_resources_mode(ManagedResourcesMode::Bundled);
+
+        let sources = cli_sources("claude", "2.1.215", "darwin-arm64");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].kind, ManagedResourceSourceKind::Bundled);
+        assert_eq!(sources[0].root, expected);
+
+        // Download mode yields no cli sources.
+        set_managed_resources_mode(ManagedResourcesMode::Download);
+        assert!(cli_sources("claude", "2.1.215", "darwin-arm64").is_empty());
+    }
+
+    #[test]
+    fn download_mode_ignores_configured_bundled_root() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("managed");
+        if !crate::test_support::run_in_env_child(
+            "managed_resources::tests::download_mode_ignores_configured_bundled_root",
             |command| {
                 command.env(BUNDLED_RESOURCES_ENV, &root);
             },
@@ -266,10 +311,7 @@ mod tests {
         set_managed_resources_mode(ManagedResourcesMode::Download);
 
         let sources = node_sources("node-v24.11.0-darwin-arm64");
-        assert!(
-            !sources.is_empty(),
-            "download mode should include bundled root for offline-first behavior"
-        );
+        assert!(sources.is_empty());
         assert!(!requires_bundled_resources());
 
         set_managed_resources_mode(ManagedResourcesMode::Download);
