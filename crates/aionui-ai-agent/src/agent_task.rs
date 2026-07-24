@@ -374,6 +374,22 @@ impl AgentInstance {
         }
     }
 
+    /// POUNDING: thin wrapper — mode change via config option.
+    /// Delegates to `set_config_option("mode", mode)`, discarding the
+    /// response value to match the legacy calling convention in
+    /// `service_ops.rs`.
+    pub async fn set_mode(&self, mode: &str) -> Result<(), AgentError> {
+        self.set_config_option("mode", mode).await.map(|_| ())
+    }
+
+    /// POUNDING: thin wrapper — model change via config option.
+    /// Delegates to `set_config_option("model", model_id)`, discarding
+    /// the response value to match the legacy calling convention in
+    /// `service_ops.rs`.
+    pub async fn set_model_confirmed(&self, model_id: &str) -> Result<(), AgentError> {
+        self.set_config_option("model", model_id).await.map(|_| ())
+    }
+
     /// Returns the cached session usage as a snake_case JSON object. The
     /// structure mirrors the ACP SDK `UsageUpdate` schema
     /// (`used` / `size` / `cost` / `_meta`), normalised via

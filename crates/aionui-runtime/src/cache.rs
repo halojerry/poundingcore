@@ -52,6 +52,10 @@ pub fn node_runtime_root() -> Option<PathBuf> {
     runtime_root().map(|root| root.join("node"))
 }
 
+pub fn native_cli_tool_root() -> Option<PathBuf> {
+    runtime_root().map(|root| root.join("native-cli"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

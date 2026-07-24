@@ -140,8 +140,7 @@ impl ConversationService {
                 return Err(err);
             }
         };
-        let response = task
-            .set_model_confirmed(&req.model_id)
+        task.set_model_confirmed(&req.model_id)
             .await
             .map_err(ConversationError::from)?;
         // Persist the model change for recovery on restart. These are
@@ -172,7 +171,7 @@ impl ConversationService {
         {
             tracing::warn!(conversation_id, model_id = %req.model_id, error = %e, "Failed to persist model to preferences");
         }
-        Ok(response)
+        task.get_model().await.map_err(ConversationError::from)
     }
 
     // ── Config Options ──────────────────────────────────────────────

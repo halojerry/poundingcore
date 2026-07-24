@@ -5,6 +5,7 @@ use crate::commands::error::{CliBoundaryCode, CliBoundaryError};
 use aionui_runtime::ensure_node_runtime;
 use aionui_runtime::managed_cli::{managed_cli_contract_for_export, prepare_managed_cli_to_root};
 use aionui_runtime::managed_resources::export_node_runtime_to_root;
+use aionui_runtime::NativeCliToolId;
 use aionui_runtime::managed_resources_contract::{
     MANAGED_RESOURCES_CONTRACT_SCHEMA_VERSION, ManagedResourcesContract, validate_contract, write_contract,
 };
@@ -108,7 +109,7 @@ fn copy_directory(src: &std::path::Path, dest: &std::path::Path) -> Result<(), S
 
 /// Manifest written alongside each bundled native CLI tool so the
 /// frontend's `materializeFromBundled()` can discover the entrypoint.
-#[derive(Debug, Serialize)]
+#[derive(Debug, serde::Serialize)]
 struct CliManifest {
     entrypoint: String,
 }

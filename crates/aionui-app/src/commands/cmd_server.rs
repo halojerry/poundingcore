@@ -310,10 +310,8 @@ pub(crate) async fn run_server(
                         active_turn_count, "conversation runtime shutdown prepared"
                     );
                     let active_task_count = worker_task_manager.active_count();
-                    match tokio::time::timeout(WORKER_TASK_SHUTDOWN_TIMEOUT, worker_task_manager.clear()).await {
-                        Ok(()) => info!(active_task_count, "worker task manager shutdown completed"),
-                        Err(_) => warn!(active_task_count, "worker task manager shutdown timed out"),
-                    }
+                    worker_task_manager.clear();
+                    info!(active_task_count, "worker task manager shutdown completed");
                 }
             }
             if let Err(error) = client_pref_service.release_keep_awake_for_shutdown().await {
