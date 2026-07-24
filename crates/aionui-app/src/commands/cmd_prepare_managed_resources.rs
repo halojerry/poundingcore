@@ -11,7 +11,7 @@ use aionui_runtime::managed_resources_contract::{
 };
 use aionui_runtime::node_runtime::managed_node_contract_for_export;
 
-const MANAGED_CLI_NAMES: [&str; 2] = ["claude", "codex"];
+const MANAGED_CLI_NAMES: [&str; 1] = ["claude"];
 
 const SUBCOMMAND: &str = "prepare-managed-resources";
 
@@ -117,13 +117,6 @@ struct CliManifest {
 fn write_cli_manifest(dest_dir: &std::path::Path, tool: NativeCliToolId) -> Result<(), String> {
     let entrypoint = match tool {
         NativeCliToolId::Hermes => tool.binary_name().to_owned(),
-        NativeCliToolId::OpenCode => {
-            if cfg!(windows) {
-                format!("{}.exe", tool.binary_name())
-            } else {
-                tool.binary_name().to_owned()
-            }
-        }
         NativeCliToolId::OpenClaw => {
             // Node-kind: entrypoint is <binary>/<binary>.mjs
             let bin = tool.binary_name();

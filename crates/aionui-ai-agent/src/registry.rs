@@ -718,7 +718,7 @@ fn apply_cached_availability(meta: &mut AgentMetadata) -> Option<UnavailableReas
 }
 
 fn is_builtin_managed_agent(meta: &AgentMetadata) -> bool {
-    meta.agent_source == AgentSource::Builtin && matches!(meta.backend.as_deref(), Some("claude") | Some("codex"))
+    meta.agent_source == AgentSource::Builtin && matches!(meta.backend.as_deref(), Some("claude"))
 }
 
 fn has_availability_snapshot(meta: &AgentMetadata) -> bool {

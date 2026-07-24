@@ -11,7 +11,6 @@ pub enum NativeCliRuntimeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeCliToolId {
     Hermes,
-    OpenCode,
     OpenClaw,
 }
 
@@ -19,7 +18,6 @@ impl NativeCliToolId {
     pub fn slug(self) -> &'static str {
         match self {
             Self::Hermes => "hermes",
-            Self::OpenCode => "opencode",
             Self::OpenClaw => "openclaw",
         }
     }
@@ -27,7 +25,6 @@ impl NativeCliToolId {
     pub fn version(self) -> &'static str {
         match self {
             Self::Hermes => "0.18.2",
-            Self::OpenCode => "1.17.18",
             Self::OpenClaw => "2026.6.11",
         }
     }
@@ -35,7 +32,6 @@ impl NativeCliToolId {
     pub fn display_name(self) -> &'static str {
         match self {
             Self::Hermes => "Hermes",
-            Self::OpenCode => "OpenCode",
             Self::OpenClaw => "OpenClaw",
         }
     }
@@ -43,7 +39,6 @@ impl NativeCliToolId {
     pub fn binary_name(self) -> &'static str {
         match self {
             Self::Hermes => "hermes",
-            Self::OpenCode => "opencode",
             Self::OpenClaw => "openclaw",
         }
     }
@@ -51,7 +46,6 @@ impl NativeCliToolId {
     pub fn from_backend(backend: &str) -> Option<Self> {
         match backend {
             "hermes" => Some(Self::Hermes),
-            "opencode" => Some(Self::OpenCode),
             "openclaw" => Some(Self::OpenClaw),
             _ => None,
         }
@@ -60,7 +54,6 @@ impl NativeCliToolId {
     pub fn from_slug(slug: &str) -> Option<Self> {
         match slug {
             "hermes" => Some(Self::Hermes),
-            "opencode" => Some(Self::OpenCode),
             "openclaw" => Some(Self::OpenClaw),
             _ => None,
         }
@@ -69,7 +62,6 @@ impl NativeCliToolId {
     pub fn runtime_kind(self) -> NativeCliRuntimeKind {
         match self {
             Self::Hermes => NativeCliRuntimeKind::Python,
-            Self::OpenCode => NativeCliRuntimeKind::Native,
             Self::OpenClaw => NativeCliRuntimeKind::Node,
         }
     }
@@ -79,7 +71,6 @@ impl NativeCliToolId {
     pub fn install_instruction(self) -> &'static str {
         match self {
             Self::Hermes => "pip install hermes-agent[acp]",
-            Self::OpenCode => "npm install -g opencode-ai",
             Self::OpenClaw => "npm install -g openclaw@latest",
         }
     }

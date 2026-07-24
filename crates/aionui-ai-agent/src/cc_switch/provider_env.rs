@@ -11,12 +11,8 @@ use super::CcSwitchPaths;
 pub(crate) struct CcSwitchSettings {
     #[serde(rename = "currentProviderClaude")]
     pub(crate) current_provider_claude: Option<String>,
-    #[serde(rename = "currentProviderCodex")]
-    pub(crate) current_provider_codex: Option<String>,
     #[serde(rename = "currentProviderHermes")]
     pub(crate) current_provider_hermes: Option<String>,
-    #[serde(rename = "currentProviderOpencode")]
-    pub(crate) current_provider_opencode: Option<String>,
     #[serde(rename = "currentProviderOpenclaw")]
     pub(crate) current_provider_openclaw: Option<String>,
 }
@@ -138,9 +134,7 @@ fn read_provider_config_json(app_type: &str) -> Option<serde_json::Value> {
 
     let provider_id = match app_type {
         "claude" => settings.current_provider_claude,
-        "codex" => settings.current_provider_codex,
         "hermes" => settings.current_provider_hermes,
-        "opencode" => settings.current_provider_opencode,
         "openclaw" => settings.current_provider_openclaw,
         _ => return None,
     }
@@ -171,161 +165,6 @@ pub fn read_provider_env_by_app_type(app_type: &str) -> HashMap<String, String> 
         return HashMap::new();
     };
     normalize_env(env_obj)
-}
-
-/// Read the Codex proxy port from `~/.pounding/codex-proxy-port`.
-/// Returns `None` if the file doesn't exist or contains an invalid port.
-fn read_codex_proxy_port() -> Option<u16> {
-    let path = dirs::home_dir()?.join(".pounding").join("codex-proxy-port");
-    let content = std::fs::read_to_string(path).ok()?;
-    let trimmed = content.trim();
-    let port: u16 = trimmed.parse().ok()?;
-    Some(port)
-}
-
-/// Ensure the Codex live config files are up to date before spawning.
-/// Reads the cc-switch DB provider row for app_type='codex' and writes
-/// ~/.codex/auth.json and ~/.codex/config.toml if the DB has newer state.
-///
-/// Overrides `base_url` with the local codex-api-proxy address when the
-/// proxy port file exists, so Codex's Responses API traffic is translated
-/// to Chat Completions for the POUNDING upstream API.
-pub fn ensure_codex_live_config() {
-    let Some(config) = read_provider_config_json("codex") else {
-        return;
-    };
-    let Some(home) = dirs::home_dir() else {
-        return;
-    };
-
-    let codex_dir = home.join(".codex");
-    let auth_path = codex_dir.join("auth.json");
-    let config_path = codex_dir.join("config.toml");
-
-    // Write auth.json
-    if let Some(auth) = config.get("auth")
-        && let Err(e) = std::fs::create_dir_all(&codex_dir)
-            .and_then(|_| std::fs::write(&auth_path, serde_json::to_string_pretty(auth).unwrap_or_default()))
-    {
-        tracing::warn!(error = %e, "cc-switch: failed to write codex auth.json");
-    }
-
-    // ── Config.toml: defense-in-depth write ──────────────────────────
-    let mut needs_write = !config_path.exists();
-    if !needs_write {
-        if let Ok(existing) = std::fs::read_to_string(&config_path) {
-            needs_write = !existing.contains("model_catalog_json");
-        } else {
-            needs_write = true;
-        }
-    }
-    if !needs_write {
-        tracing::debug!("cc-switch: codex config.toml exists and is complete; skip");
-    } else {
-        tracing::info!("cc-switch: writing codex config.toml (fallback)");
-
-        let mut model = config.get("model").and_then(|v| v.as_str()).unwrap_or("").to_owned();
-        let mut model_provider = config
-            .get("model_provider")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
-        let mut base_url = config.get("base_url").and_then(|v| v.as_str()).unwrap_or("").to_owned();
-        let mut wire_api = config
-            .get("wire_api")
-            .and_then(|v| v.as_str())
-            .unwrap_or("responses")
-            .to_owned();
-
-        // Fallback: if the top-level keys are empty, try parsing the legacy "config" TOML field
-        if model.is_empty()
-            && model_provider.is_empty()
-            && base_url.is_empty()
-            && let Some(toml_str) = config.get("config").and_then(|v| v.as_str())
-        {
-            for line in toml_str.lines() {
-                let trimmed = line.trim();
-                if let Some(val) = trimmed.strip_prefix("model_provider = ") {
-                    model_provider = val.trim_matches('"').to_owned();
-                } else if let Some(val) = trimmed.strip_prefix("model = ") {
-                    model = val.trim_matches('"').to_owned();
-                } else if let Some(val) = trimmed.strip_prefix("base_url = ") {
-                    base_url = val.trim_matches('"').to_owned();
-                } else if let Some(val) = trimmed.strip_prefix("wire_api = ") {
-                    wire_api = val.trim_matches('"').to_owned();
-                }
-            }
-        }
-
-        // Override base_url with the local codex-api-proxy port when available
-        if let Some(port) = read_codex_proxy_port() {
-            base_url = format!("http://127.0.0.1:{port}/v1");
-            tracing::info!(port, "cc-switch: codex base_url overridden to local proxy");
-        }
-
-        let toml_content = format!(
-            "model_provider = \"{model_provider}\"\n\
-             model = \"{model}\"\n\
-             model_catalog_json = \"pounding-models.json\"\n\
-             \n\
-             [model_providers]\n\
-             [model_providers.\"{model_provider}\"]\n\
-             name = \"POUNDING API\"\n\
-             base_url = \"{base_url}\"\n\
-             wire_api = \"{wire_api}\"\n\
-             requires_openai_auth = true\n"
-        );
-
-        if let Err(e) = std::fs::create_dir_all(&codex_dir).and_then(|_| std::fs::write(&config_path, &toml_content)) {
-            tracing::warn!(error = %e, "cc-switch: failed to write codex config.toml");
-        }
-    }
-}
-
-/// Ensure the OpenCode live config file is up to date before spawning.
-pub fn ensure_opencode_live_config() {
-    let Some(config) = read_provider_config_json("opencode") else {
-        return;
-    };
-    let Some(home) = dirs::home_dir() else {
-        return;
-    };
-
-    let model = config.get("model").and_then(|v| v.as_str()).unwrap_or("");
-    let api_key = config.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
-    let base_url = config.get("base_url").and_then(|v| v.as_str()).unwrap_or("");
-    let npm = config
-        .get("npm")
-        .and_then(|v| v.as_str())
-        .unwrap_or("@ai-sdk/openai-compatible");
-    let provider_id = model.split('/').next().unwrap_or("pounding-managed");
-
-    let opencode_config = serde_json::json!({
-        "$schema": "https://opencode.ai/config.json",
-        "model": model,
-        "provider": {
-            provider_id: {
-                "npm": npm,
-                "options": {
-                    "baseURL": base_url,
-                    "apiKey": api_key,
-                },
-                "models": {
-                    model.split('/').nth(1).unwrap_or(""): { "name": model.split('/').nth(1).unwrap_or("") }
-                }
-            }
-        }
-    });
-
-    let config_path = home.join(".opencode").join("config.json");
-    if let Err(e) = std::fs::create_dir_all(config_path.parent().unwrap()).and_then(|_| {
-        std::fs::write(
-            &config_path,
-            serde_json::to_string_pretty(&opencode_config).unwrap_or_default(),
-        )
-    }) {
-        tracing::warn!(error = %e, "cc-switch: failed to write opencode config.json");
-    }
 }
 
 /// Ensure the OpenClaw live config file is up to date before spawning.

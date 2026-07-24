@@ -33,7 +33,6 @@ impl ManagedCliError {
 fn npm_package(name: &str) -> Option<&'static str> {
     match name {
         "claude" => Some("@anthropic-ai/claude-code"),
-        "codex" => Some("@openai/codex"),
         _ => None,
     }
 }
@@ -157,30 +156,6 @@ pub async fn prepare_managed_cli_to_root(name: &str, out_root: &Path) -> Result<
             std::fs::copy(&src, &dst).map_err(ManagedCliError::io)?;
             set_executable(&dst)?;
             (format!("claude{}", exe_suffix()), Vec::new())
-        }
-        "codex" => {
-            let pkg = find_platform_package(&node_modules, "@openai", "codex-")?;
-            let src_vendor = pkg.join("vendor");
-            if !src_vendor.is_dir() {
-                return Err(ManagedCliError::new(format!(
-                    "codex vendor dir missing at {}",
-                    src_vendor.display()
-                )));
-            }
-            managed_resources::materialize_directory(&src_vendor, &cli_root.join("vendor"))
-                .map_err(ManagedCliError::io)?;
-            // Locate the vendor triple dir (e.g. vendor/aarch64-apple-darwin).
-            let triple = first_subdir_name(&cli_root.join("vendor"))?;
-            let exe = format!("vendor/{triple}/bin/codex{}", exe_suffix());
-            let exe_abs = cli_root.join(&exe);
-            if !exe_abs.is_file() {
-                return Err(ManagedCliError::new(format!(
-                    "codex binary missing at {}",
-                    exe_abs.display()
-                )));
-            }
-            set_executable(&exe_abs)?;
-            (exe, vec![format!("vendor/{triple}")])
         }
         _ => return Err(ManagedCliError::new(format!("unknown CLI {name}"))),
     };
