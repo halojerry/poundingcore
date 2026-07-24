@@ -1164,12 +1164,12 @@
         "ru-RU": "Эксперт POUNDING",
         "uk-UA": "Експерт POUNDING"
       },
-      "description": "Expert guide for installing, configuring, and troubleshooting POUNDING's CLI agents: Claude Code, Codex, OpenClaw, OpenCode, and Hermes Agent.",
+      "description": "Expert guide for installing, configuring, and troubleshooting POUNDING's CLI agents: Claude Code, OpenClaw, and Hermes Agent.",
       "description_i18n": {
-        "en-US": "Expert guide for installing, configuring, and troubleshooting POUNDING's CLI agents: Claude Code, Codex, OpenClaw, OpenCode, and Hermes Agent.",
-        "zh-CN": "帮助安装、配置和排查 POUNDING 支持的 CLI 代理：Claude Code、Codex、OpenClaw、OpenCode、Hermes Agent。",
-        "ru-RU": "Эксперт по установке, настройке и устранению неполадок CLI-агентов POUNDING: Claude Code, Codex, OpenClaw, OpenCode и Hermes Agent.",
-        "uk-UA": "Експерт зі встановлення, налаштування та усунення несправностей CLI-агентів POUNDING: Claude Code, Codex, OpenClaw, OpenCode та Hermes Agent."
+        "en-US": "Expert guide for installing, configuring, and troubleshooting POUNDING's CLI agents: Claude Code, OpenClaw, and Hermes Agent.",
+        "zh-CN": "帮助安装、配置和排查 POUNDING 支持的 CLI 代理：Claude Code、OpenClaw、Hermes Agent。",
+        "ru-RU": "Эксперт по установке, настройке и устранению неполадок CLI-агентов POUNDING: Claude Code, OpenClaw и Hermes Agent.",
+        "uk-UA": "Експерт зі встановлення, налаштування та усунення несправностей CLI-агентів POUNDING: Claude Code, OpenClaw та Hermes Agent."
       },
       "avatar": "avatars/pounding-expert.jpg",
       "agent_ref": "aionrs",
