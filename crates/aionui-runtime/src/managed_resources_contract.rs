@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 
 pub const MANAGED_RESOURCES_CONTRACT_FILE: &str = "manifest.json";
 pub const MANAGED_RESOURCES_CONTRACT_SCHEMA_VERSION: u8 = 2;
-const REQUIRED_CLI_NAMES: [&str; 2] = ["claude", "codex"];
+const REQUIRED_CLI_NAMES: [&str; 1] = ["claude"];
 const SUPPORTED_RUNTIME_KEYS: [&str; 6] = [
     "win32-x64",
     "win32-arm64",
@@ -335,11 +335,11 @@ mod tests {
     fn validate_contract_rejects_missing_required_cli_name() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut contract = example_contract("win32-x64");
-        contract.clis.retain(|cli| cli.name != "codex");
+        contract.clis.retain(|cli| cli.name != "claude");
 
         let error = validate_contract(temp.path(), &contract).expect_err("missing required name should fail");
 
-        assert!(error.to_string().contains("missing required clis name codex"));
+        assert!(error.to_string().contains("missing required clis name claude"));
     }
 
     #[test]
