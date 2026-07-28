@@ -892,8 +892,8 @@ mod tests {
 
         let context = repos.builder().build(&row).await.unwrap();
         let acp = acp_context(context);
-        assert_eq!(acp.config.agent_id.as_deref(), Some("builtin-codex-test"));
-        assert_eq!(acp.config.backend.as_deref(), Some("codex"));
+        assert_eq!(acp.config.agent_id.as_deref(), Some("builtin-hermes-test"));
+        assert_eq!(acp.config.backend.as_deref(), Some("hermes"));
     }
 
     #[tokio::test]
