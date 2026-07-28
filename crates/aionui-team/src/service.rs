@@ -2130,7 +2130,7 @@ mod tests {
             Box::pin(std::future::ready(()))
         }
 
-        async fn clear(&self) {}
+        fn clear(&self) {}
 
         fn active_count(&self) -> usize {
             self.tasks.len()
@@ -2255,7 +2255,7 @@ mod tests {
             Box::pin(std::future::ready(()))
         }
 
-        async fn clear(&self) {
+        fn clear(&self) {
             self.tasks.lock().unwrap().clear();
         }
 
