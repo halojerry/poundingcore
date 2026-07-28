@@ -95,7 +95,7 @@ async fn registry() -> Arc<AgentRegistry> {
 #[tokio::test]
 async fn apply_handshake_derives_catalogs_from_config_options_before_persisting() {
     let reg = registry().await;
-    let opencode = reg.find_builtin_by_backend("opencode").await.unwrap();
+    let opencode = reg.find_builtin_by_backend("hermes").await.unwrap();
 
     reg.apply_handshake_inner(
         &opencode.id,
@@ -159,7 +159,7 @@ async fn apply_handshake_derives_catalogs_from_config_options_before_persisting(
 #[tokio::test]
 async fn apply_handshake_falls_back_to_available_catalogs_when_config_options_have_no_catalogs() {
     let reg = registry().await;
-    let opencode = reg.find_builtin_by_backend("opencode").await.unwrap();
+    let opencode = reg.find_builtin_by_backend("hermes").await.unwrap();
     let explicit_models = serde_json::json!({
         "current_model_id": "explicit",
         "current_model_label": "Explicit",
@@ -192,7 +192,7 @@ async fn apply_handshake_falls_back_to_available_catalogs_when_config_options_ha
 #[tokio::test]
 async fn apply_handshake_prefers_config_options_over_available_catalogs() {
     let reg = registry().await;
-    let opencode = reg.find_builtin_by_backend("opencode").await.unwrap();
+    let opencode = reg.find_builtin_by_backend("hermes").await.unwrap();
     let existing_modes = serde_json::json!({
         "current_mode_id": "existing-mode",
         "available_modes": [{"id": "existing-mode", "name": "Existing Mode"}]
@@ -271,7 +271,7 @@ async fn apply_handshake_prefers_config_options_over_available_catalogs() {
 #[tokio::test]
 async fn apply_handshake_config_only_partial_prefers_config_options_over_existing_catalogs() {
     let reg = registry().await;
-    let opencode = reg.find_builtin_by_backend("opencode").await.unwrap();
+    let opencode = reg.find_builtin_by_backend("hermes").await.unwrap();
     let explicit_modes = serde_json::json!({
         "current_mode_id": "explicit-mode",
         "available_modes": [{"id": "explicit-mode", "name": "Explicit Mode"}]
@@ -341,7 +341,7 @@ async fn apply_handshake_config_only_partial_prefers_config_options_over_existin
 #[tokio::test]
 async fn apply_handshake_merges_partial_config_option_updates_before_persisting() {
     let reg = registry().await;
-    let opencode = reg.find_builtin_by_backend("opencode").await.unwrap();
+    let opencode = reg.find_builtin_by_backend("hermes").await.unwrap();
 
     reg.apply_handshake_inner(
         &opencode.id,

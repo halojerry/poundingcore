@@ -49,12 +49,12 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
     .bind("shared")
     .bind(
         json!([
-            {"slot_id":"slot-lead","agent_id":"opencode","role":"lead"},
-            {"slot_id":"slot-1","agent_id":"opencode","role":"teammate"}
+            {"slot_id":"slot-lead","agent_id":"hermes","role":"lead"},
+            {"slot_id":"slot-1","agent_id":"hermes","role":"teammate"}
         ])
         .to_string(),
     )
-    .bind("opencode")
+    .bind("hermes")
     .bind("build")
     .bind("1.0.0")
     .bind(ANCHOR_CREATED_AT)
@@ -75,7 +75,7 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
     .bind("aionrs")
     .bind(
         json!({
-            "agentId": "opencode",
+            "agentId": "hermes",
             "assistant_id": "assistant-team",
             "teamId": "team-1",
             "role": "teammate",
@@ -107,7 +107,7 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
     .bind("system_default_user")
     .bind("Nearby conversation shown in screenshot")
     .bind("aionrs")
-    .bind(json!({"agentId":"opencode"}).to_string())
+    .bind(json!({"agentId":"hermes"}).to_string())
     .bind(json!({"providerId":"prov-secret","modelId":"anthropic/claude-sonnet-4"}).to_string())
     .bind("finished")
     .bind("aionui")
@@ -155,7 +155,7 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
     .bind("aionrs")
     .bind(
         json!({
-            "agentId": "opencode",
+            "agentId": "hermes",
             "teamId": "team-deleted",
             "role": "lead",
             "slot_id": "slot-deleted"
@@ -184,7 +184,7 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
     .bind("system_default_user")
     .bind("Deleted assistant direct conversation should not be returned")
     .bind("aionrs")
-    .bind(json!({"agentId":"opencode"}).to_string())
+    .bind(json!({"agentId":"hermes"}).to_string())
     .bind(json!({"providerId":"prov-secret","modelId":"deleted/assistant-model"}).to_string())
     .bind("finished")
     .bind("aionui")
@@ -366,7 +366,7 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
     )
     .bind("conv-auth")
     .bind("builtin")
-    .bind("opencode")
+    .bind("hermes")
     .bind("sess-1")
     .bind("idle")
     .bind(
@@ -398,7 +398,7 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
     )
     .bind("conv-nearby")
     .bind("builtin")
-    .bind("opencode")
+    .bind("hermes")
     .bind("sess-nearby")
     .bind("idle")
     .bind(
@@ -429,13 +429,13 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
              created_at, updated_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind("opencode")
-    .bind("OpenCode")
-    .bind("opencode")
+    .bind("hermes")
+    .bind("Hermes")
+    .bind("hermes")
     .bind("acp")
     .bind("builtin")
     .bind(true)
-    .bind("opencode")
+    .bind("hermes")
     .bind(json!(["run", "--token", "sk-agent-args-secret"]).to_string())
     .bind(json!({"OPENAI_API_KEY":"sk-agent-env-secret"}).to_string())
     .bind(None::<String>)
@@ -484,7 +484,7 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
         .bind("{}")
         .bind("none")
         .bind(None::<String>)
-        .bind("opencode")
+        .bind("hermes")
         .bind("none")
         .bind(None::<String>)
         .bind("[]")
@@ -578,7 +578,7 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
         .bind(definition_id)
         .bind(assistant_id)
         .bind("user")
-        .bind("opencode")
+        .bind("hermes")
         .bind("rules should not leak")
         .bind("auto")
         .bind(resolved_model_id)
@@ -874,7 +874,7 @@ async fn global_summary_includes_recent_diagnostics_without_sensitive_payloads()
         "Nearby conversation shown in screenshot"
     );
     assert_eq!(direct_conversations[0]["assistant_id"], "assistant-direct");
-    assert_eq!(direct_conversations[0]["agent_id"], "opencode");
+    assert_eq!(direct_conversations[0]["agent_id"], "hermes");
     assert_eq!(direct_conversations[0]["current_model_id"], "anthropic/claude-sonnet-4");
     assert_eq!(
         direct_conversations[0]["recent_errors"][0]["content"]["error"]["message"],
@@ -895,7 +895,7 @@ async fn global_summary_includes_recent_diagnostics_without_sensitive_payloads()
     assert_eq!(teams[0]["name"], "Diagnostics Team");
     assert_eq!(teams[0]["workspace_mode"], "shared");
     assert_eq!(teams[0]["session_mode"], "build");
-    assert_eq!(teams[0]["lead_agent_id"], "opencode");
+    assert_eq!(teams[0]["lead_agent_id"], "hermes");
     assert_eq!(teams[0]["agent_count"], 2);
     assert_eq!(teams[0]["conversation_count"], 1);
     assert_eq!(teams[0]["message_count"], 3);
@@ -974,7 +974,7 @@ async fn global_summary_includes_recent_diagnostics_without_sensitive_payloads()
         .expect("agent health items should be included");
     let opencode_agent = agent_items
         .iter()
-        .find(|item| item["id"] == "opencode")
+        .find(|item| item["id"] == "hermes")
         .expect("opencode agent health should be included");
     assert_eq!(opencode_agent["last_check_status"], "ok");
 

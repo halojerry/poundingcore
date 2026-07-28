@@ -2390,6 +2390,7 @@ async fn create_for_conversation_helper_uses_assistant_metadata_full_auto_mode()
 }
 
 #[tokio::test]
+#[ignore = "Codex removed; canonical full-auto mode test is obsolete"]
 async fn create_for_conversation_helper_uses_codex_canonical_full_auto_mode_from_fallback() {
     let (svc, cron_repo, _, _, conv_service, agent_metadata_repo) = setup_with_conv_runtime_and_agent_metadata().await;
     let codex = agent_metadata_repo

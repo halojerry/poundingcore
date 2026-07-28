@@ -1308,12 +1308,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_yolo_id_maps_to_agent_full_access() {
+    async fn claude_yolo_id_remains_default() {
         let reg = registry().await;
-        let codex = reg.find_builtin_by_backend("codex").await.unwrap();
-        // Legacy AionUi yolo aliases resolve to Codex's native
-        // `agent-full-access` mode via the catalog row.
-        assert_eq!(codex.yolo_id.as_deref(), Some("agent-full-access"));
+        let claude = reg.find_builtin_by_backend("claude").await.unwrap();
+        // Claude uses the default yolo_id; the legacy 'agent-full-access'
+        // alias was specific to Codex which has been removed.
+        assert!(claude.yolo_id.is_none());
     }
 
     #[tokio::test]

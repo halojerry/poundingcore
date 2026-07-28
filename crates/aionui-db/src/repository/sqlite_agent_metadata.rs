@@ -788,6 +788,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Codex removed; agent row 8e1acf31 no longer seeded"]
     async fn builtin_managed_acp_rows_drop_runtime_bridge_command() {
         let (repo, _db) = setup().await;
 

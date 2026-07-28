@@ -834,13 +834,13 @@ mod tests {
     #[tokio::test]
     async fn acp_unassigned_session_runtime_is_startup_seed_not_resume_snapshot() {
         let repos = setup().await;
-        upsert_builtin(&repos, "builtin-codex-test", "codex").await;
+        upsert_builtin(&repos, "builtin-hermes-test", "hermes").await;
         repos
             .acp_session_repo
             .create(&CreateAcpSessionParams {
                 conversation_id: "conv-1",
                 agent_source: "builtin",
-                agent_id: "builtin-codex-test",
+                agent_id: "builtin-hermes-test",
             })
             .await
             .unwrap();
@@ -878,13 +878,13 @@ mod tests {
     async fn acp_session_identity_takes_priority_over_legacy_backend_seed() {
         let repos = setup().await;
         upsert_builtin(&repos, "builtin-claude-test", "claude").await;
-        upsert_builtin(&repos, "builtin-codex-test", "codex").await;
+        upsert_builtin(&repos, "builtin-hermes-test", "hermes").await;
         repos
             .acp_session_repo
             .create(&CreateAcpSessionParams {
                 conversation_id: "conv-1",
                 agent_source: "builtin",
-                agent_id: "builtin-codex-test",
+                agent_id: "builtin-hermes-test",
             })
             .await
             .unwrap();
