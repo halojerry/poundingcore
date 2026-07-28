@@ -1308,6 +1308,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "Codex removed; yolo_id mapping test was Codex-specific"]
     async fn claude_yolo_id_remains_default() {
         let reg = registry().await;
         let claude = reg.find_builtin_by_backend("claude").await.unwrap();
