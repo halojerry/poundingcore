@@ -1,3 +1,8 @@
+#![allow(dead_code)]
+// Codex CLI support was removed in July 2026. This module is retained
+// as documentation of the sandbox sync protocol and may be fully
+// deleted in a future cleanup pass.
+
 use std::path::PathBuf;
 
 use aionui_api_types::AgentMetadata;

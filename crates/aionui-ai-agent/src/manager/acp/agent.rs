@@ -745,6 +745,7 @@ impl AcpAgentManager {
     }
 
     /// Set the mode for the current session.
+    #[allow(dead_code)]
     pub(crate) async fn set_mode(&self, mode: &str) -> Result<(), AgentError> {
         let normalized_mode = normalize_requested_mode(&self.params.metadata, mode);
         if normalized_mode.is_empty() {
@@ -825,6 +826,7 @@ impl AcpAgentManager {
         Ok(())
     }
 
+    #[allow(dead_code)]
     async fn apply_confirmed_model_selection(&self, model_id: &str) -> Result<SessionModelState, AgentError> {
         let session_id = {
             let session = self.session.read().await;
@@ -907,6 +909,7 @@ impl AcpAgentManager {
     }
 
     /// Set the model for the current session.
+    #[allow(dead_code)]
     pub(crate) async fn set_model(&self, model_id: &str) -> Result<(), AgentError> {
         self.apply_confirmed_model_selection(model_id).await?;
         Ok(())
@@ -914,6 +917,7 @@ impl AcpAgentManager {
 
     /// Set the model and return the confirmed model state from this write,
     /// without re-reading the asynchronously mutable session cache.
+    #[allow(dead_code)]
     pub(crate) async fn set_model_confirmed(&self, model_id: &str) -> Result<SessionModelState, AgentError> {
         self.apply_confirmed_model_selection(model_id).await
     }
