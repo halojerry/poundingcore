@@ -286,24 +286,17 @@ async fn fetch_models_at_url(
     // Read the raw body as text first so we can retry parsing without
     // re-fetching (resp.json() consumes the body).
     let text = resp.text().await.map_err(|e| remote_error(&e))?;
-    let body: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-        SystemError::BadGateway(format!("Failed to parse POUNDING API response: {e}"))
-    })?;
+    let body: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| SystemError::BadGateway(format!("Failed to parse POUNDING API response: {e}")))?;
 
     // Normalize: extract the flat model array, matching the same field order
     // as the frontend's normalizeModelList().
     let data = body.get("data");
     let models_arr = data
         .and_then(|d| {
-            d.get("data")         // { data: { data: [...] } }
+            d.get("data") // { data: { data: [...] } }
                 .or_else(|| d.get("models")) // { data: { models: [...] } }
-                .or_else(|| {
-                    if d.is_array() {
-                        Some(d)
-                    } else {
-                        None
-                    }
-                }) // { data: [...] }
+                .or_else(|| if d.is_array() { Some(d) } else { None }) // { data: [...] }
         })
         .or_else(|| body.get("data").filter(|d| d.is_array())) // { data: [...] }
         .and_then(|v| v.as_array());

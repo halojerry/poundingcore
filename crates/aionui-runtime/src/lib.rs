@@ -18,6 +18,10 @@ pub use agent_env::agent_process_env;
 pub use cache::init;
 pub use managed_cli::{CLAUDE_CLI_VERSION, cli_version, resolve_bundled_cli};
 pub use managed_resources::{ManagedResourcesMode, managed_resources_mode, set_managed_resources_mode};
+pub use native_cli_runtime::{
+    NativeCliToolError, NativeCliToolId, NativeCliToolSupport, ResolvedNativeCliTool, SharedNativeCliProgressReporter,
+    ensure_native_cli_tool, ensure_native_cli_tool_with_reporter,
+};
 pub use node_runtime::{
     DoctorRow, NodeRuntimeError, NodeRuntimeFailureKind, NodeRuntimeProgress, NodeRuntimeProgressPhase,
     NodeRuntimeProgressReporter, NodeRuntimeSupport, NodeTool, ResolvedCommand, ResolvedNodeRuntime,
@@ -26,10 +30,6 @@ pub use node_runtime::{
     ensure_runtime_command_with_reporter, probe_node_runtime_supported, probe_runtime_command,
 };
 pub use registry_npx_lock::{RegistryNpxLockError, pin_registry_npx_args, should_skip_registry_npx_version_probe};
-pub use native_cli_runtime::{
-    NativeCliToolError, NativeCliToolId, NativeCliToolSupport, ResolvedNativeCliTool,
-    SharedNativeCliProgressReporter, ensure_native_cli_tool, ensure_native_cli_tool_with_reporter,
-};
 pub use resolver::{resolve_command_in, resolve_command_path};
 pub use shell_env::enhance_process_path;
 mod spawn;

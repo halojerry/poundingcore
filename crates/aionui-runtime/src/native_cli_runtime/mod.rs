@@ -257,17 +257,23 @@ fn activate_local_tool_source(
 fn platform_spec() -> Result<PlatformSpec, NativeCliToolError> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Ok(PlatformSpec {
-            manifest_key: "darwin-arm64",        }),
+            manifest_key: "darwin-arm64",
+        }),
         ("macos", "x86_64") => Ok(PlatformSpec {
-            manifest_key: "darwin-x64",        }),
+            manifest_key: "darwin-x64",
+        }),
         ("linux", "aarch64") => Ok(PlatformSpec {
-            manifest_key: "linux-arm64",        }),
+            manifest_key: "linux-arm64",
+        }),
         ("linux", "x86_64") => Ok(PlatformSpec {
-            manifest_key: "linux-x64",        }),
+            manifest_key: "linux-x64",
+        }),
         ("windows", "x86_64") => Ok(PlatformSpec {
-            manifest_key: "win32-x64",        }),
+            manifest_key: "win32-x64",
+        }),
         ("windows", "aarch64") => Ok(PlatformSpec {
-            manifest_key: "win32-arm64",        }),
+            manifest_key: "win32-arm64",
+        }),
         (os, arch) => Err(NativeCliToolError::unsupported_platform(format!(
             "native CLI unsupported on {os}/{arch}"
         ))),
@@ -401,5 +407,4 @@ mod tests {
         assert!(error.to_string().contains("bundled native CLI"));
         assert!(error.to_string().contains("artifact missing"));
     }
-
 }

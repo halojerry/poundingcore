@@ -13,7 +13,9 @@ use aionui_api_types::{SessionMcpServer, SessionMcpTransport};
 use aionui_common::CommandSpec;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
-use aionui_mcp::{AcpMcpCapabilities, AcpSessionMcpServer, ImageGenConfig, build_builtin_image_gen_server, parse_acp_mcp_capabilities};
+use aionui_mcp::{
+    AcpMcpCapabilities, AcpSessionMcpServer, ImageGenConfig, build_builtin_image_gen_server, parse_acp_mcp_capabilities,
+};
 use aionui_runtime::{ensure_runtime_command, ensure_runtime_command_with_reporter};
 use tracing::{debug, info, warn};
 

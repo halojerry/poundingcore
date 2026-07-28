@@ -562,9 +562,7 @@ impl TeamAgentProvisioner {
             if resolved.is_some() {
                 resolved.unwrap()
             } else {
-                self.fallback_provider_id()
-                    .await
-                    .unwrap_or_else(|| backend.to_owned())
+                self.fallback_provider_id().await.unwrap_or_else(|| backend.to_owned())
             }
         } else {
             backend.to_owned()

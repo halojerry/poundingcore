@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::managed_cli::{cli_version, current_runtime_key};
-use crate::managed_resources;
 use crate::managed_resources_contract::ManagedCliResourceContract;
 use crate::node_runtime::ensure_node_runtime;
 use crate::spawn::Builder;
@@ -209,17 +208,6 @@ fn find_platform_package(node_modules: &Path, scope: &str, prefix: &str) -> Resu
         "no platform package {scope}/{prefix}* installed under {}",
         scope_dir.display()
     )))
-}
-
-fn first_subdir_name(dir: &Path) -> Result<String, ManagedCliError> {
-    let entries =
-        std::fs::read_dir(dir).map_err(|error| ManagedCliError::new(format!("read {}: {error}", dir.display())))?;
-    for entry in entries.flatten() {
-        if entry.path().is_dir() {
-            return Ok(entry.file_name().to_string_lossy().into_owned());
-        }
-    }
-    Err(ManagedCliError::new(format!("no subdirectory under {}", dir.display())))
 }
 
 #[cfg(unix)]
