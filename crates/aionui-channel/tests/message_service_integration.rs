@@ -518,14 +518,14 @@ async fn send_to_agent_without_assistant_name_falls_back_to_legacy_channel_name(
     conversation_svc.with_assistant_preference_repo(assistant_preference_repo);
     definition_repo
         .upsert(&bare_assistant_definition_params(
-            "asstdef-channel-codex",
-            "bare-codex",
+            "asstdef-channel-claude",
+            "bare-claude",
             "claude",
         ))
         .await
         .unwrap();
     pref_repo
-        .upsert_batch(&[("assistant.telegram.agent", r#"{"assistant_id":"bare-codex"}"#)])
+        .upsert_batch(&[("assistant.telegram.agent", r#"{"assistant_id":"bare-claude"}"#)])
         .await
         .unwrap();
 
@@ -554,5 +554,5 @@ async fn send_to_agent_without_assistant_name_falls_back_to_legacy_channel_name(
         .unwrap();
 
     let conversation = conversation_repo.get(&result.conversation_id).await.unwrap().unwrap();
-    assert_eq!(conversation.name, "tg-acp-codex-70880480");
+    assert_eq!(conversation.name, "tg-acp-claude-70880480");
 }
