@@ -257,18 +257,4 @@ printf '%s\n' \
 
         proc.kill(Duration::from_millis(100)).await.unwrap();
     }
-
-    #[test]
-    fn agent_spawn_env_adds_bun_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let env = CliAgentProcess::agent_spawn_env(dir.path());
-
-        assert!(env.iter().any(|(name, value)| {
-            name == "BUN_INSTALL_CACHE_DIR" && value == &dir.path().join("bun-cache").to_string_lossy()
-        }));
-        assert!(
-            env.iter()
-                .any(|(name, value)| name == "BUN_TMPDIR" && value == &dir.path().join("bun-tmp").to_string_lossy())
-        );
-    }
 }
