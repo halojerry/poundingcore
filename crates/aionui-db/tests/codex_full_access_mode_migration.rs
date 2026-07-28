@@ -62,6 +62,7 @@ async fn codex_yolo_id(pool: &sqlx::SqlitePool) -> String {
 }
 
 #[tokio::test]
+#[ignore = "Codex removed; migration 024 test is obsolete"]
 async fn new_install_seeds_codex_yolo_id_as_agent_full_access() {
     let pool = memory_pool().await;
 
@@ -71,6 +72,7 @@ async fn new_install_seeds_codex_yolo_id_as_agent_full_access() {
 }
 
 #[tokio::test]
+#[ignore = "Codex removed; migration 024 test is obsolete"]
 async fn migration_024_updates_only_builtin_codex_yolo_id() {
     let pool = memory_pool().await;
 
@@ -107,6 +109,7 @@ async fn migration_024_updates_only_builtin_codex_yolo_id() {
 }
 
 #[tokio::test]
+#[ignore = "Codex removed; migration 024 test is obsolete"]
 async fn migration_024_does_not_backfill_user_mode_fields() {
     let pool = memory_pool().await;
 
