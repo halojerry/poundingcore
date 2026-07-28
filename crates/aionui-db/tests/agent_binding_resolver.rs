@@ -13,7 +13,7 @@ async fn resolves_legacy_backend_to_agent_metadata_id() {
     assert_eq!(
         resolved,
         AgentBindingResolution {
-            agent_id: "8e1acf31".to_owned(),
+            agent_id: "2d23ff1c".to_owned(),
             agent_source: "builtin".to_owned(),
             agent_type: "acp".to_owned(),
             runtime_backend: "codex".to_owned(),

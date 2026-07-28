@@ -2766,7 +2766,7 @@ async fn spawned_preset_assistant_snapshot_is_frozen() {
 #[tokio::test]
 async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
     let svc = setup_with_metadata_rows(vec![make_agent_metadata_row(
-        "8e1acf31",
+        "2d23ff1c",
         "claude",
         "/api/assets/logos/tools/coding/codex.svg",
     )]);

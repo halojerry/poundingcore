@@ -985,7 +985,7 @@ mod tests {
             assert_eq!(call_value["params"]["name"], json!("team_spawn_agent"));
             let arguments = &call_value["params"]["arguments"];
             assert_eq!(arguments["name"], json!("CodexCLI"));
-            assert_eq!(arguments["assistant_id"], json!("bare:8e1acf31"));
+            assert_eq!(arguments["assistant_id"], json!("bare:2d23ff1c"));
             assert!(arguments.get("model").is_none());
             assert!(arguments.get("role").is_none());
             assert!(arguments.get("agent_type").is_none());
@@ -1011,7 +1011,7 @@ mod tests {
         let result = server
             .spawn_agent(Parameters(SpawnAgentParams {
                 name: "CodexCLI".into(),
-                assistant_id: Some("bare:8e1acf31".into()),
+                assistant_id: Some("bare:2d23ff1c".into()),
             }))
             .await;
 

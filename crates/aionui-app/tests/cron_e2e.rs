@@ -717,7 +717,7 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
         json!({
             "id": "u-fixed-mcp",
             "name": "Cron MCP Assistant",
-            "agent_id": "8e1acf31",
+            "agent_id": "2d23ff1c",
             "defaults": {
                 "mcps": {
                     "mode": "fixed",

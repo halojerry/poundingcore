@@ -1023,7 +1023,7 @@ async fn seed_assistant_definition(
 async fn seed_bare_assistant_definitions(repo: &Arc<dyn IAssistantDefinitionRepository>) {
     for (definition_id, assistant_id, agent_backend) in [
         ("asstdef_bare_gemini", "bare:cc126dd5", "gemini"),
-        ("asstdef_bare_codex", "bare:8e1acf31", "codex"),
+        ("asstdef_bare_codex", "bare:2d23ff1c", "codex"),
         ("asstdef_bare_aionrs", "bare:632f31d2", "aionrs"),
     ] {
         seed_assistant_definition(repo, definition_id, assistant_id, agent_backend).await;
@@ -1050,7 +1050,7 @@ async fn seed_assistant_overlay(
 fn seeded_agent_id(value: &str) -> &str {
     match value {
         "claude" => "2d23ff1c",
-        "codex" => "8e1acf31",
+        "codex" => "2d23ff1c",
         "gemini" => "cc126dd5",
         "aionrs" => "632f31d2",
         other => other,

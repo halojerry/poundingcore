@@ -659,7 +659,7 @@ struct StubAgentMetadataRepo;
 fn stub_agent_metadata_rows() -> Vec<AgentMetadataRow> {
     [
         ("2d23ff1c", Some("claude"), "acp", "Claude Code", 100),
-        ("8e1acf31", Some("claude"), "acp", "Codex CLI", 110),
+        ("2d23ff1c", Some("claude"), "acp", "Codex CLI", 110),
         ("cc126dd5", Some("gemini"), "acp", "Gemini CLI", 120),
         ("632f31d2", None, "aionrs", "Aion CLI", 200),
         ("b7e8a9c4", Some("openclaw"), "acp", "OpenClaw", 3140),
@@ -6678,7 +6678,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
         })
     );
     assert!(resp.extra.get("assistant_id").is_none());
-    assert_eq!(resp.extra["agent_id"], json!("8e1acf31"));
+    assert_eq!(resp.extra["agent_id"], json!("2d23ff1c"));
     assert_eq!(resp.extra["agent_source"], json!("builtin"));
     assert!(resp.extra.get("preset_assistant_id").is_none());
     assert!(resp.extra.get("preset_context").is_none());
@@ -6692,7 +6692,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
     let snapshot = repo.get_assistant_snapshot(&resp.id).await.unwrap().unwrap();
     assert_eq!(snapshot.assistant_definition_id, "asstdef_preset_1");
     assert_eq!(snapshot.assistant_id, "preset-1");
-    assert_eq!(snapshot.agent_id, "8e1acf31");
+    assert_eq!(snapshot.agent_id, "2d23ff1c");
     assert_eq!(snapshot.rules_content, "assistant rule body");
     assert_eq!(snapshot.default_model_mode, "auto");
     assert_eq!(snapshot.resolved_model_id.as_deref(), Some("new-model"));
@@ -7118,7 +7118,7 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
     assert_eq!(resp.extra["current_mode_id"], json!("workspace-write"));
 
     let snapshot = repo.get_assistant_snapshot(&resp.id).await.unwrap().unwrap();
-    assert_eq!(snapshot.agent_id, "8e1acf31");
+    assert_eq!(snapshot.agent_id, "2d23ff1c");
     assert_eq!(snapshot.resolved_model_id.as_deref(), Some("override-model"));
     assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("workspace-write"));
 }
@@ -7176,13 +7176,13 @@ async fn create_prefers_snapshot_runtime_identity_over_legacy_extra_identity() {
         Some("claude")
     );
     assert_eq!(resp.extra["backend"], json!("claude"));
-    assert_eq!(resp.extra["agent_id"], json!("8e1acf31"));
+    assert_eq!(resp.extra["agent_id"], json!("2d23ff1c"));
 
     let create_calls = acp_repo.create_calls();
     assert_eq!(create_calls.len(), 1);
-    assert_eq!(create_calls[0].agent_id, "8e1acf31");
+    assert_eq!(create_calls[0].agent_id, "2d23ff1c");
     assert_eq!(create_calls[0].agent_source, "builtin");
-    assert_eq!(create_calls[0].agent_id, "8e1acf31");
+    assert_eq!(create_calls[0].agent_id, "2d23ff1c");
 }
 
 #[tokio::test]

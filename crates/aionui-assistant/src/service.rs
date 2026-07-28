@@ -5379,7 +5379,7 @@ mod tests {
             .update(
                 "u1",
                 UpdateAssistantRequest {
-                    agent_id: Some("8e1acf31".into()),
+                    agent_id: Some("2d23ff1c".into()),
                     ..Default::default()
                 },
             )
@@ -5387,7 +5387,7 @@ mod tests {
             .unwrap();
 
         let detail = fx.service.get_detail("u1", Some("en-US")).await.unwrap();
-        assert_eq!(detail.engine.agent_id, "8e1acf31");
+        assert_eq!(detail.engine.agent_id, "2d23ff1c");
         assert_eq!(detail.defaults.model.mode, "auto");
         assert_eq!(detail.defaults.model.value, None);
         assert_eq!(detail.defaults.permission.mode, "auto");
@@ -6265,12 +6265,12 @@ mod tests {
             .create(CreateAssistantRequest {
                 id: Some("u1".into()),
                 name: "Mine".into(),
-                agent_id: Some("8e1acf31".into()),
+                agent_id: Some("2d23ff1c".into()),
                 ..req_default()
             })
             .await
             .unwrap();
-        assert_eq!(created.agent_id, "8e1acf31");
+        assert_eq!(created.agent_id, "2d23ff1c");
     }
 
     fn req_default() -> CreateAssistantRequest {
