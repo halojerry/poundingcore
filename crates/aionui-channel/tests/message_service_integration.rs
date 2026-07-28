@@ -520,7 +520,7 @@ async fn send_to_agent_without_assistant_name_falls_back_to_legacy_channel_name(
         .upsert(&bare_assistant_definition_params(
             "asstdef-channel-codex",
             "bare-codex",
-            "codex",
+            "claude",
         ))
         .await
         .unwrap();

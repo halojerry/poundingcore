@@ -38,7 +38,7 @@ async fn fake_context_conversation(Path(id): Path<String>) -> axum::Json<serde_j
                 "source": "user",
                 "name": "Current Assistant",
                 "avatar": "",
-                "backend": "codex"
+                "backend": "claude"
             },
             "extra": {}
         }

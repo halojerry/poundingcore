@@ -1939,7 +1939,7 @@ fn acp_agent_metadata_row(id: &str, backend: &str, yolo_id: Option<&str>) -> Age
 fn seeded_agent_metadata_repo() -> Arc<dyn IAgentMetadataRepository> {
     Arc::new(StubAgentMetadataRepo::with_rows(vec![
         acp_agent_metadata_row("claude-id", "claude", Some("bypassPermissions")),
-        acp_agent_metadata_row("codex-id", "codex", Some("full-access")),
+        acp_agent_metadata_row("codex-id", "claude", Some("full-access")),
         acp_agent_metadata_row("gemini-id", "gemini", Some("yolo")),
     ]))
 }
@@ -2518,7 +2518,7 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
             assistant_definition_id: "def-team-lead".into(),
             enabled: true,
             sort_order: 0,
-            agent_id_override: Some("codex".into()),
+            agent_id_override: Some("claude".into()),
             last_used_at: None,
             created_at: 0,
             updated_at: 0,
@@ -2550,11 +2550,11 @@ async fn tc_create_team_derives_backend_from_assistant_when_backend_missing() {
         .await
         .unwrap();
 
-    assert_eq!(created.assistants[0].backend, "codex");
+    assert_eq!(created.assistants[0].backend, "claude");
     let extra = conv_repo
         .get_extra(&created.assistants[0].conversation_id)
         .expect("lead conversation extra");
-    assert_eq!(extra.get("backend").and_then(serde_json::Value::as_str), Some("codex"));
+    assert_eq!(extra.get("backend").and_then(serde_json::Value::as_str), Some("claude"));
     assert_eq!(
         extra.get("assistant_id").and_then(serde_json::Value::as_str),
         Some("assistant-lead")
@@ -2604,7 +2604,7 @@ async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
             assistant_definition_id: "def-team-lead".into(),
             enabled: true,
             sort_order: 0,
-            agent_id_override: Some("codex".into()),
+            agent_id_override: Some("claude".into()),
             last_used_at: None,
             created_at: 0,
             updated_at: 0,
@@ -2636,11 +2636,11 @@ async fn tc_create_team_ignores_requested_backend_when_assistant_id_present() {
         .await
         .unwrap();
 
-    assert_eq!(created.assistants[0].backend, "codex");
+    assert_eq!(created.assistants[0].backend, "claude");
     let extra = conv_repo
         .get_extra(&created.assistants[0].conversation_id)
         .expect("lead conversation extra");
-    assert_eq!(extra.get("backend").and_then(serde_json::Value::as_str), Some("codex"));
+    assert_eq!(extra.get("backend").and_then(serde_json::Value::as_str), Some("claude"));
 }
 
 fn fake_preset_snapshot(rules: &str, skills: &[&str], mcp_server_ids: &[&str]) -> FakePresetAssistantSnapshot {
@@ -2767,7 +2767,7 @@ async fn spawned_preset_assistant_snapshot_is_frozen() {
 async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
     let svc = setup_with_metadata_rows(vec![make_agent_metadata_row(
         "8e1acf31",
-        "codex",
+        "claude",
         "/api/assets/logos/tools/coding/codex.svg",
     )]);
 
@@ -2798,7 +2798,7 @@ async fn ta_add_agent_uses_model_fallback_for_acp_backend() {
                 name: "Coder".into(),
                 role: "teammate".into(),
                 backend: Some("acp".into()),
-                model: "codex".into(),
+                model: "claude".into(),
                 assistant_id: None,
             },
         )
@@ -2850,7 +2850,7 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
             assistant_definition_id: "def-team-worker".into(),
             enabled: true,
             sort_order: 0,
-            agent_id_override: Some("codex".into()),
+            agent_id_override: Some("claude".into()),
             last_used_at: None,
             created_at: 0,
             updated_at: 0,
@@ -2898,7 +2898,7 @@ async fn ta_add_agent_derives_backend_from_assistant_when_backend_missing() {
         .await
         .unwrap();
 
-    assert_eq!(added.backend, "codex");
+    assert_eq!(added.backend, "claude");
     assert_eq!(added.assistant_id.as_deref(), Some("assistant-worker"));
 }
 
@@ -2944,7 +2944,7 @@ async fn ta_add_agent_ignores_requested_backend_when_assistant_id_present() {
             assistant_definition_id: "def-team-worker".into(),
             enabled: true,
             sort_order: 0,
-            agent_id_override: Some("codex".into()),
+            agent_id_override: Some("claude".into()),
             last_used_at: None,
             created_at: 0,
             updated_at: 0,
@@ -2992,7 +2992,7 @@ async fn ta_add_agent_ignores_requested_backend_when_assistant_id_present() {
         .await
         .unwrap();
 
-    assert_eq!(added.backend, "codex");
+    assert_eq!(added.backend, "claude");
 }
 
 #[tokio::test]
@@ -4877,7 +4877,7 @@ async fn spawn_agent_in_session_succeeds_without_active_team_run() {
             assistant_definition_id: "def-spawn-worker".into(),
             enabled: true,
             sort_order: 0,
-            agent_id_override: Some("codex".into()),
+            agent_id_override: Some("claude".into()),
             last_used_at: None,
             created_at: 0,
             updated_at: 0,

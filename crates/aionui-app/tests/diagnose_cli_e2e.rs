@@ -184,7 +184,7 @@ async fn fake_teams() -> axum::Json<serde_json::Value> {
                     {
                         "name": "Reviewer",
                         "role": "review",
-                        "backend": "codex",
+                        "backend": "claude",
                         "conversation_id": "member-conv"
                     }
                 ]

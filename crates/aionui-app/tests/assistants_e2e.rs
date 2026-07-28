@@ -166,7 +166,7 @@ async fn fixture() -> Fixture {
             {
                 "id": "builtin-office",
                 "name": "Office",
-                "agent_ref": "codex",
+                "agent_ref": "claude",
                 "enabled_skills": ["officecli-docx"],
                 "rule_file": "rules/office.{locale}.md",
                 "avatar": "office.png",
@@ -174,7 +174,7 @@ async fn fixture() -> Fixture {
             {
                 "id": "builtin-bare",
                 "name": "Bare",
-                "agent_ref": "codex",
+                "agent_ref": "claude",
             }
         ]
     });
@@ -321,7 +321,7 @@ async fn fixture() -> Fixture {
             builtin,
             agent_catalog: Some(Arc::new(TestAgentCatalog {
                 rows: vec![
-                    test_agent_row("8e1acf31", Some("codex"), AgentType::Acp, "Codex CLI"),
+                    test_agent_row("8e1acf31", Some("claude"), AgentType::Acp, "Codex CLI"),
                     test_agent_row("cc126dd5", Some("gemini"), AgentType::Acp, "Gemini CLI"),
                     test_agent_row("632f31d2", None, AgentType::Aionrs, "Aion CLI"),
                 ],
@@ -390,7 +390,7 @@ async fn list_populated_excludes_extension_assistants() {
     assert_eq!(office["agent_id"], "8e1acf31");
     assert_eq!(office["agent"]["type"], "acp");
     assert_eq!(office["agent"]["source"], "builtin");
-    assert_eq!(office["agent"]["acp_backend"], "codex");
+    assert_eq!(office["agent"]["acp_backend"], "claude");
     assert!(office["agent"].get("backend").is_none());
     assert!(office["agent"].get("id").is_none());
 }
@@ -592,7 +592,7 @@ async fn get_detail_returns_definition_state_preferences_and_rules() {
     assert_eq!(data["state"]["enabled"], false);
     assert_eq!(data["state"]["sort_order"], 7);
     assert_eq!(data["engine"]["agent_id"], "8e1acf31");
-    assert_eq!(data["engine"]["agent"]["acp_backend"], "codex");
+    assert_eq!(data["engine"]["agent"]["acp_backend"], "claude");
     assert!(data["engine"]["agent"].get("backend").is_none());
     assert!(data["engine"]["agent"].get("id").is_none());
     assert_eq!(data["engine"]["agent"]["type"], "acp");
@@ -628,7 +628,7 @@ async fn get_detail_generated_assistant_exposes_generated_runtime_fields() {
     assert_eq!(data["team_selectable"], true);
     assert_eq!(data["team_block_reason"], Value::Null);
     assert_eq!(data["engine"]["agent_id"], "8e1acf31");
-    assert_eq!(data["engine"]["agent"]["acp_backend"], "codex");
+    assert_eq!(data["engine"]["agent"]["acp_backend"], "claude");
     assert!(data["engine"]["agent"].get("backend").is_none());
     assert!(data["engine"]["agent"].get("id").is_none());
     assert_eq!(data["engine"]["agent"]["type"], "acp");

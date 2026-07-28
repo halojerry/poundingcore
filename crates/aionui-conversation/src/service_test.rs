@@ -659,7 +659,7 @@ struct StubAgentMetadataRepo;
 fn stub_agent_metadata_rows() -> Vec<AgentMetadataRow> {
     [
         ("2d23ff1c", Some("claude"), "acp", "Claude Code", 100),
-        ("8e1acf31", Some("codex"), "acp", "Codex CLI", 110),
+        ("8e1acf31", Some("claude"), "acp", "Codex CLI", 110),
         ("cc126dd5", Some("gemini"), "acp", "Gemini CLI", 120),
         ("632f31d2", None, "aionrs", "Aion CLI", 200),
         ("b7e8a9c4", Some("openclaw"), "acp", "OpenClaw", 3140),
@@ -906,7 +906,7 @@ impl StubAcpSessionRepo {
         AcpSessionRow {
             conversation_id: conversation_id.to_owned(),
             agent_source: "builtin".into(),
-            agent_id: "codex".into(),
+            agent_id: "claude".into(),
             session_id: self.session_id.lock().unwrap().clone(),
             session_status: "idle".into(),
             session_config: "{}".into(),
@@ -1614,7 +1614,7 @@ async fn create_derives_acp_type_from_assistant_backend_when_type_is_missing() {
         &definition_repo,
         "asstdef_acp_missing_type",
         "assistant-acp-missing-type",
-        "codex",
+        "claude",
         "auto",
         "auto",
     )
@@ -4157,7 +4157,7 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
         &definition_repo,
         "asstdef_acp_auto",
         "assistant-acp-auto",
-        "codex",
+        "claude",
         "auto",
         "auto",
     )
@@ -4185,7 +4185,7 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
         .await
         .unwrap();
 
-    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-auto").await;
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "claude", "assistant-acp-auto").await;
 
     let agent = Arc::new(MockAgent::new(&conv.id));
     task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
@@ -4255,7 +4255,7 @@ async fn set_config_option_does_not_persist_preference_on_error() {
         &definition_repo,
         "asstdef_acp_auto",
         "assistant-acp-auto",
-        "codex",
+        "claude",
         "auto",
         "auto",
     )
@@ -4283,7 +4283,7 @@ async fn set_config_option_does_not_persist_preference_on_error() {
         .await
         .unwrap();
 
-    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-auto").await;
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "claude", "assistant-acp-auto").await;
 
     // Agent reports a session-change conflict (mirrors the legacy ACK-then-
     // session-changed race): the service must return the error and leave the
@@ -4324,7 +4324,7 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
         &definition_repo,
         "asstdef_acp_fixed",
         "assistant-acp-fixed",
-        "codex",
+        "claude",
         "fixed",
         "fixed",
         "fixed",
@@ -4353,7 +4353,7 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
         .await
         .unwrap();
 
-    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-fixed").await;
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "claude", "assistant-acp-fixed").await;
     let agent = Arc::new(MockAgent::new(&conv.id));
     task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
 
@@ -4407,7 +4407,7 @@ async fn set_config_option_command_ack_does_not_persist_assistant_preference() {
         &definition_repo,
         "asstdef_acp_ack",
         "assistant-acp-ack",
-        "codex",
+        "claude",
         "auto",
         "auto",
     )
@@ -4435,7 +4435,7 @@ async fn set_config_option_command_ack_does_not_persist_assistant_preference() {
         .await
         .unwrap();
 
-    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "assistant-acp-ack").await;
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "claude", "assistant-acp-ack").await;
     let agent = Arc::new(
         MockAgent::new(&conv.id).with_set_config_option_response(SetConfigOptionResponse {
             confirmation: ConfigOptionConfirmation::CommandAck,
@@ -6229,7 +6229,7 @@ async fn warmup_keeps_generic_error_for_non_openclaw_gateway_signature() {
     )));
 
     let conv = svc
-        .create("user_1", make_create_req_with_backend("codex"))
+        .create("user_1", make_create_req_with_backend("claude"))
         .await
         .unwrap();
 
@@ -6629,7 +6629,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
             assistant_definition_id: "asstdef_preset_1",
             enabled: true,
             sort_order: 0,
-            agent_id_override: Some("codex"),
+            agent_id_override: Some("claude"),
             last_used_at: None,
         })
         .await
@@ -6674,7 +6674,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
             source: "builtin".into(),
             name: "Preset".into(),
             avatar: "🤖".into(),
-            backend: "codex".into(),
+            backend: "claude".into(),
         })
     );
     assert!(resp.extra.get("assistant_id").is_none());
@@ -6712,7 +6712,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
             source: "builtin".into(),
             name: "Preset".into(),
             avatar: "🤖".into(),
-            backend: "codex".into(),
+            backend: "claude".into(),
         })
     );
 
@@ -6736,7 +6736,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
             source: "builtin".into(),
             name: "Preset".into(),
             avatar: "🤖".into(),
-            backend: "codex".into(),
+            backend: "claude".into(),
         })
     );
 }
@@ -6954,7 +6954,7 @@ async fn assistant_backed_acp_build_options_include_snapshot_rule_as_preset_cont
         &definition_repo,
         "asstdef_preset_acp_rule",
         "preset-acp-rule",
-        "codex",
+        "claude",
         "auto",
         "auto",
     )
@@ -6970,7 +6970,7 @@ async fn assistant_backed_acp_build_options_include_snapshot_rule_as_preset_cont
         .await
         .unwrap();
 
-    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "codex", "preset-acp-rule").await;
+    let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "claude", "preset-acp-rule").await;
     let row = repo.get(&conv.id).await.unwrap().unwrap();
     let options = svc.build_task_options(&row).await.unwrap();
 
@@ -7074,7 +7074,7 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
             assistant_definition_id: "asstdef_preset_legacy_seed",
             enabled: true,
             sort_order: 0,
-            agent_id_override: Some("codex"),
+            agent_id_override: Some("claude"),
             last_used_at: None,
         })
         .await
@@ -7137,7 +7137,7 @@ async fn create_prefers_snapshot_runtime_identity_over_legacy_extra_identity() {
         &definition_repo,
         "asstdef_snapshot_identity",
         "preset-snapshot-identity",
-        "codex",
+        "claude",
         "auto",
         "auto",
     )
@@ -7173,9 +7173,9 @@ async fn create_prefers_snapshot_runtime_identity_over_legacy_extra_identity() {
 
     assert_eq!(
         resp.assistant.as_ref().map(|assistant| assistant.backend.as_str()),
-        Some("codex")
+        Some("claude")
     );
-    assert_eq!(resp.extra["backend"], json!("codex"));
+    assert_eq!(resp.extra["backend"], json!("claude"));
     assert_eq!(resp.extra["agent_id"], json!("8e1acf31"));
 
     let create_calls = acp_repo.create_calls();
@@ -7235,7 +7235,7 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
             assistant_definition_id: "asstdef_preset_fixed",
             enabled: true,
             sort_order: 0,
-            agent_id_override: Some("codex"),
+            agent_id_override: Some("claude"),
             last_used_at: None,
         })
         .await
@@ -7333,7 +7333,7 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
             assistant_definition_id: "asstdef_preset_auto",
             enabled: true,
             sort_order: 0,
-            agent_id_override: Some("codex"),
+            agent_id_override: Some("claude"),
             last_used_at: None,
         })
         .await

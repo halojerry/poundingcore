@@ -285,7 +285,7 @@ fn default_assistants() -> Vec<AvailableAssistant> {
         AvailableAssistant {
             assistant_id: "writer-assistant".into(),
             name: "Writer Assistant".into(),
-            backend: "codex".into(),
+            backend: "claude".into(),
             description: "Writing-focused assistant".into(),
             skills: vec!["drafting".into()],
         },

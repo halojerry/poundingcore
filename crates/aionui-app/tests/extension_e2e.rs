@@ -115,7 +115,7 @@ fn write_legacy_extension_fixture(tmp: &TempDir) -> std::path::PathBuf {
                         "id": "legacy-agent",
                         "name": "Legacy Agent",
                         "avatar": "assets/agent.png",
-                        "agentType": "codex",
+                        "agentType": "claude",
                         "contextFile": "agents/context.md",
                         "models": ["codex-mini"],
                         "enabledSkills": ["review-skill"],
@@ -501,7 +501,7 @@ async fn eq16_legacy_assistant_agent_and_theme_endpoints_preserve_contract() {
     let agents = agent_json["data"].as_array().unwrap();
     assert_eq!(agents.len(), 1);
     assert_eq!(agents[0]["id"], "ext-legacy-agent");
-    assert_eq!(agents[0]["agentType"], "codex");
+    assert_eq!(agents[0]["agentType"], "claude");
     assert_eq!(agents[0]["enabledSkills"][0], "review-skill");
     assert_eq!(agents[0]["prompts"][0], "Ship it");
     assert_eq!(agents[0]["models"][0], "codex-mini");
