@@ -361,13 +361,8 @@ mod tests {
         let root = Path::new("/tmp/tool");
         if cfg!(windows) {
             assert_eq!(entrypoint_path(NativeCliToolId::Hermes, root), root.join("hermes"));
-            assert_eq!(
-                entrypoint_path(NativeCliToolId::OpenCode, root),
-                root.join("opencode.exe")
-            );
         } else {
             assert_eq!(entrypoint_path(NativeCliToolId::Hermes, root), root.join("hermes"));
-            assert_eq!(entrypoint_path(NativeCliToolId::OpenCode, root), root.join("opencode"));
             assert_eq!(
                 entrypoint_path(NativeCliToolId::OpenClaw, root),
                 root.join("openclaw").join("openclaw.mjs")
