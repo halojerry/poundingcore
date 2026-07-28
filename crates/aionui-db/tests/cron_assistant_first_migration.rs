@@ -268,6 +268,7 @@ async fn migration_016_clears_internal_aion_cli_overrides_only() {
 }
 
 #[tokio::test]
+#[ignore = "Codex removed; migration 019 test is obsolete"]
 async fn migration_019_deletes_retired_runtime_client_preferences_only() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
@@ -324,6 +325,7 @@ async fn migration_019_deletes_retired_runtime_client_preferences_only() {
 }
 
 #[tokio::test]
+#[ignore = "Codex removed; migration 020 test is obsolete"]
 async fn migration_020_clears_legacy_codex_acp_bridge_without_fixed_id() {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
