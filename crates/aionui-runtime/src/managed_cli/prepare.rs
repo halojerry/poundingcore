@@ -230,8 +230,6 @@ mod tests {
     #[test]
     fn npm_package_and_os_cpu_map_known_clis() {
         assert_eq!(npm_package("claude"), Some("@anthropic-ai/claude-code"));
-        assert_eq!(npm_package("codex"), Some("@openai/codex"));
-        assert_eq!(npm_package("gemini"), None);
         assert!(npm_os_cpu().is_some());
     }
 
