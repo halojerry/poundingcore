@@ -77,6 +77,7 @@ pub async fn run_prepare_managed_resources(args: PrepareManagedResourcesArgs) ->
     Ok(ExitCode::SUCCESS)
 }
 
+#[allow(dead_code)]
 fn detect_platform_key() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "darwin-arm64",
@@ -89,6 +90,7 @@ fn detect_platform_key() -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn copy_directory(src: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
     if !src.is_dir() {
         return Err(format!("source directory missing: {}", src.display()));
@@ -110,10 +112,12 @@ fn copy_directory(src: &std::path::Path, dest: &std::path::Path) -> Result<(), S
 /// Manifest written alongside each bundled native CLI tool so the
 /// frontend's `materializeFromBundled()` can discover the entrypoint.
 #[derive(Debug, serde::Serialize)]
+#[allow(dead_code)]
 struct CliManifest {
     entrypoint: String,
 }
 
+#[allow(dead_code)]
 fn write_cli_manifest(dest_dir: &std::path::Path, tool: NativeCliToolId) -> Result<(), String> {
     let entrypoint = match tool {
         NativeCliToolId::Hermes => tool.binary_name().to_owned(),

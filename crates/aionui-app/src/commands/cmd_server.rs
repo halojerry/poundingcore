@@ -19,6 +19,7 @@ use crate::bootstrap::{BootstrapError, BootstrapErrorCode, ParentExitSignal, Ser
 
 const LISTENING_EVENT_PREFIX: &str = "POUNDINGCORE_LISTENING";
 const DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS: usize = 50;
+#[allow(dead_code)]
 const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
