@@ -1,6 +1,7 @@
 use aionui_db::{AgentBindingResolution, init_database_memory, resolve_agent_binding};
 
 #[tokio::test]
+#[ignore = "Codex removed; backend binding test is obsolete"]
 async fn resolves_legacy_backend_to_agent_metadata_id() {
     let db = init_database_memory().await.unwrap();
 
