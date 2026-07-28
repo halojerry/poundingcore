@@ -1050,6 +1050,8 @@ mod tests {
         let source = ManagedNodeDownloadSource::official(PlatformSpec {
             folder_suffix: "darwin-arm64",
             archive_ext: "tar.gz",
+            runtime_key: "darwin-arm64",
+            executable: "bin/node",
         });
 
         assert_eq!(source.source, "nodejs.org");
@@ -1148,6 +1150,8 @@ mod tests {
             PlatformSpec {
                 folder_suffix: "darwin-arm64",
                 archive_ext: "tar.gz",
+                runtime_key: "darwin-arm64",
+                executable: "bin/node",
             },
             None,
         )
