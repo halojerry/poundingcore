@@ -313,8 +313,8 @@ async fn management_endpoint_handles_openclaw_as_acp_backend() {
         .expect("OpenClaw ACP row should be visible from /api/agents/management");
     assert!(meta.available || openclaw["status"] != "available");
     assert_eq!(openclaw["agent_type"], "acp");
-    // command is NULL post migration 014 — the field is absent from JSON
-    assert!(openclaw.get("command").is_none() || openclaw["command"].is_null());
+    // Migration 033 sets command='openclaw' for native CLI discovery.
+    assert_eq!(openclaw["command"], "openclaw");
     assert_eq!(openclaw["args"], json!(["acp"]));
 }
 
