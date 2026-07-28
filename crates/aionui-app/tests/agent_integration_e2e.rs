@@ -295,9 +295,8 @@ async fn management_endpoint_handles_openclaw_as_acp_backend() {
         .expect("OpenClaw ACP builtin row should exist");
     assert_eq!(meta.agent_type, AgentType::Acp);
     assert_eq!(meta.backend.as_deref(), Some("openclaw"));
-    // Migration 014 moved OpenClaw to the managed native CLI path:
-    // command is now NULL and resolved at runtime via NativeCliToolId.
-    assert_eq!(meta.command, None);
+    // Migration 033 sets command='openclaw' for native CLI discovery.
+    assert_eq!(meta.command.as_deref(), Some("openclaw"));
     assert_eq!(meta.args, vec!["acp"]);
     assert_eq!(meta.agent_source, AgentSource::Builtin);
 
