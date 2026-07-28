@@ -135,6 +135,19 @@ pub trait IMockAgent: IAgentTask {
             answer: None,
         })
     }
+    /// Default mode switching — no-op for mocks that don't need it.
+    async fn set_mode(&self, _mode: &str) -> Result<(), AgentError> {
+        Ok(())
+    }
+    /// Default model switching — no-op for mocks that don't need it.
+    async fn set_model(&self, _model_id: &str) -> Result<(), AgentError> {
+        Ok(())
+    }
+    /// Default confirmed model switch — delegates to set_model + get_model.
+    async fn set_model_confirmed(&self, model_id: &str) -> Result<GetModelInfoResponse, AgentError> {
+        self.set_model(model_id).await?;
+        self.get_model().await
+    }
 }
 
 /// Concrete, closed-set dispatcher for runnable agent variants.
