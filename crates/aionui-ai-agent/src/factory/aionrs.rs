@@ -969,6 +969,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[ignore = "requires bundled node runtime prepared via prepare-managed-resources"]
     async fn row_to_mcp_server_config_flattens_resolved_npx_command() {
         let _lock = path_test_lock().lock().await;
         let runtime = install_fake_bundled_runtime();
