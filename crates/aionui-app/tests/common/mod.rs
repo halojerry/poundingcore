@@ -209,22 +209,10 @@ impl IMockAgent for NoopMockAgent {
         })
     }
 
-    async fn set_model(&self, model_id: &str) -> Result<(), aionui_ai_agent::AgentError> {
-        *self.model.lock().unwrap() = model_id.to_owned();
-        Ok(())
-    }
-
     // POUNDING keeps the dedicated `/config-options/model` route, which the
     // service redirects to `set_model_confirmed`; the subsequent
     // `get_config_options` must observe the new value. Mutate the shared model
     // state so the read-back reflects the write.
-    async fn set_model_confirmed(
-        &self,
-        model_id: &str,
-    ) -> Result<aionui_api_types::GetModelInfoResponse, aionui_ai_agent::AgentError> {
-        self.set_model(model_id).await?;
-        self.get_model().await
-    }
 
     async fn get_config_options(
         &self,
@@ -246,6 +234,21 @@ impl IMockAgent for NoopMockAgent {
             confirmation: aionui_api_types::ConfigOptionConfirmation::Observed,
             config_options: Some(vec![model_config_option(&self.model.lock().unwrap())]),
         })
+    }
+}
+
+impl NoopMockAgent {
+    async fn set_model(&self, model_id: &str) -> Result<(), aionui_ai_agent::AgentError> {
+        *self.model.lock().unwrap() = model_id.to_owned();
+        Ok(())
+    }
+
+    async fn set_model_confirmed(
+        &self,
+        model_id: &str,
+    ) -> Result<aionui_api_types::GetModelInfoResponse, aionui_ai_agent::AgentError> {
+        self.set_model(model_id).await?;
+        <NoopMockAgent as IMockAgent>::get_model(self).await
     }
 }
 

@@ -559,8 +559,8 @@ impl TeamAgentProvisioner {
         );
         let provider_id = if agent_type == AgentType::Aionrs {
             let resolved = self.resolve_provider_for_model(model).await;
-            if resolved.is_some() {
-                resolved.unwrap()
+            if let Some(resolved) = resolved {
+                resolved
             } else {
                 self.fallback_provider_id().await.unwrap_or_else(|| backend.to_owned())
             }
