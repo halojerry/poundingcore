@@ -2368,6 +2368,7 @@ async fn create_for_conversation_helper_keeps_conversation_extra_mode_unchanged(
 }
 
 #[tokio::test]
+#[ignore = "Codex removed; full-auto mode test was Codex-specific"]
 async fn create_for_conversation_helper_uses_assistant_metadata_full_auto_mode() {
     let (svc, cron_repo, _, _, conv_service) = setup_with_conv_runtime().await;
     let runtime_state = conv_service.runtime_state();
