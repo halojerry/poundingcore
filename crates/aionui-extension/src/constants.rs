@@ -23,7 +23,7 @@ pub const STATE_PERSIST_DEBOUNCE_MS: u64 = 500;
 pub const RESERVED_NAME_PREFIXES: &[&str] = &["aion-", "internal-", "builtin-", "system-"];
 
 /// Preset agent type identifiers.
-pub const PRESET_AGENT_TYPES: &[&str] = &["gemini", "claude", "codex", "codebuddy", "opencode"];
+pub const PRESET_AGENT_TYPES: &[&str] = &["gemini", "claude", "codebuddy"];
 
 // ---------------------------------------------------------------------------
 // Lifecycle hook timeouts (seconds)
