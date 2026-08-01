@@ -1015,7 +1015,7 @@
       "avatar": "avatars/pounding-ozon-assistant.png",
       "agent_ref": "aionrs",
       "enabled_skills": [
-        "pounding-ozon-assistant"
+        "pounding-ozon-probe"
       ],
       "custom_skill_names": [],
       "disabled_builtin_skills": [],
