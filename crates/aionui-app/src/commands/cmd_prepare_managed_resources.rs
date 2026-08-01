@@ -2,7 +2,6 @@ use std::process::ExitCode;
 
 use crate::cli::PrepareManagedResourcesArgs;
 use crate::commands::error::{CliBoundaryCode, CliBoundaryError};
-use aionui_runtime::NativeCliToolId;
 use aionui_runtime::ensure_node_runtime;
 use aionui_runtime::managed_cli::{managed_cli_contract_for_export, prepare_managed_cli_to_root};
 use aionui_runtime::managed_resources::export_node_runtime_to_root;
@@ -45,6 +44,12 @@ pub async fn run_prepare_managed_resources(args: PrepareManagedResourcesArgs) ->
         let prepared = prepare_managed_cli_to_root(name, &output_root)
             .await
             .map_err(|error| prepare_managed_resources_error_with_detail("cli.prepare", error))?;
+        // Write a per-CLI manifest.json so the desktop app's
+        // resolveBundledCliDir() / materializeFromBundled() can discover the
+        // native binary for offline PATH registration. Without this the TS
+        // bundled fallback was dead code (PRD offline-oob-cli-install-fixes).
+        write_cli_manifest(&prepared.root, &prepared.executable)
+            .map_err(|error| prepare_managed_resources_error_with_detail("cli.manifest", error))?;
         println!("  {:<6} -> {}", name, prepared.root.display());
         prepared_clis.push(prepared);
     }
@@ -110,32 +115,29 @@ fn copy_directory(src: &std::path::Path, dest: &std::path::Path) -> Result<(), S
 }
 
 /// Manifest written alongside each bundled native CLI tool so the
-/// frontend's `materializeFromBundled()` can discover the entrypoint.
+/// frontend's `materializeFromBundled()` can discover the entrypoint
+/// (`resolveBundledCliDir` requires a manifest.json in the CLI directory).
+///
+/// `kind: "native"` signals verify-bundle-integrity.sh that version/platform
+/// fields are optional. `entrypoint` carries the platform executable name
+/// (e.g. `claude.exe` on Windows — matches prepare.rs `exe_suffix()`).
 #[derive(Debug, serde::Serialize)]
-#[allow(dead_code)]
 struct CliManifest {
     entrypoint: String,
+    kind: &'static str,
 }
 
-#[allow(dead_code)]
-fn write_cli_manifest(dest_dir: &std::path::Path, tool: NativeCliToolId) -> Result<(), String> {
-    let entrypoint = match tool {
-        NativeCliToolId::Hermes => tool.binary_name().to_owned(),
-        NativeCliToolId::OpenClaw => {
-            // Node-kind: entrypoint is <binary>/<binary>.mjs
-            let bin = tool.binary_name();
-            format!("{bin}/{bin}.mjs")
-        }
+fn write_cli_manifest(dest_dir: &std::path::Path, executable: &str) -> Result<(), String> {
+    let manifest = CliManifest {
+        entrypoint: executable.to_owned(),
+        kind: "native",
     };
-
-    let manifest = CliManifest { entrypoint };
     let manifest_path = dest_dir.join("manifest.json");
     std::fs::write(
         &manifest_path,
-        serde_json::to_vec_pretty(&manifest)
-            .map_err(|e| format!("serialize manifest.json for {}: {e}", tool.slug()))?,
+        serde_json::to_vec_pretty(&manifest).map_err(|e| format!("serialize manifest.json: {e}"))?,
     )
-    .map_err(|e| format!("write manifest.json for {}: {e}", tool.slug()))?;
+    .map_err(|e| format!("write manifest.json: {e}"))?;
 
     Ok(())
 }
