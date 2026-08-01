@@ -1,0 +1,92 @@
+{
+  "_说明": "信封结构参考 — Agent 组装 GraphInput 时参考此文件",
+
+  "_单SKU选品": {
+    "token": "supabase_token（Worker 鉴权用，由 Skill 自动填充）",
+    "ozon_client_id": "5371047（Ozon 卖家后台 Client ID）",
+    "ozon_api_key": "xxx（Ozon API Key）",
+    "envelope": {
+      "draft": {
+        "item_id": "1688商品ID（如 980815374096）",
+        "title": "中文标题（Worker 自动翻译为俄语）",
+        "images": [
+          "https://cbu01.alicdn.com/xxx.jpg（商品主图）",
+          "https://cbu01.alicdn.com/xxx2.jpg（详情图）"
+        ],
+        "weight": 1000,
+        "_weight_说明": "单位：克（int）。1688 原始数据可能为 kg，Skill 自动转换",
+        "dimensions": {
+          "length": 220,
+          "width": 165,
+          "height": 110
+        },
+        "_dimensions_说明": "单位：mm（int）。1688 原始数据为 cm，Skill 自动 ×10",
+        "purchase_cost": 25.0,
+        "_purchase_cost_说明": "采购成本（CNY，float）= 1688 变体价格 + 国内运费(freightCny)",
+        "purchase_url": "https://detail.1688.com/offer/xxx.html",
+        "currency": "CNY",
+        "attributes": {
+          "材质": "不锈钢",
+          "颜色": "黑色",
+          "品牌": "无品牌"
+        },
+        "_attributes_说明": "dict[中文属性名→值]。Worker 自动翻译为俄语并匹配 Ozon 属性",
+        "supplier": "义乌市xxx厂",
+        "_supplier_说明": "1688 供应商名，Worker 用于填充制造商属性(attr=23487)",
+        "stock": 100,
+        "sku_id": "1688 SKU ID（可选）",
+        "price": 25.0,
+        "original_price": 30.0,
+        "_price_说明": "SKU 价格（CNY），由 Skill 自动填充"
+      },
+      "source": {
+        "purchase_url": "https://detail.1688.com/offer/xxx.html",
+        "purchase_cost": 25.0
+      },
+      "extensions": {
+        "margin_rate": 0.25,
+        "_margin_rate_说明": "利润率（默认 0.25 = 25%）",
+        "commission_rate": 0.10,
+        "_commission_rate_说明": "Ozon 佣金率（默认 0.10 = 10%）",
+        "fx_buffer": 0.05,
+        "_fx_buffer_说明": "汇率缓冲（默认 0.05 = 5%）。CNY 店铺不使用"
+      }
+    }
+  },
+
+  "_跟卖示例": {
+    "token": "supabase_token",
+    "ozon_client_id": "5371047",
+    "ozon_api_key": "xxx",
+    "envelope": {
+      "draft": {
+        "item_id": "1688商品ID",
+        "title": "中文标题",
+        "images": ["https://cbu01.alicdn.com/xxx.jpg"],
+        "weight": 500,
+        "dimensions": {"length": 150, "width": 100, "height": 80},
+        "purchase_cost": 12.0,
+        "purchase_url": "https://detail.1688.com/offer/xxx.html",
+        "currency": "CNY",
+        "ozon_product_id": "1925631822",
+        "_ozon_product_id_说明": "Ozon 竞品的产品 ID（跟卖时必填）"
+      },
+      "source": {
+        "purchase_url": "https://detail.1688.com/offer/xxx.html",
+        "purchase_cost": 12.0
+      },
+      "extensions": {
+        "follow_sell": true,
+        "_follow_sell_说明": "标记为跟卖，Worker 走跟卖管线（import-by-sku）"
+      }
+    }
+  },
+
+  "_关键约定": {
+    "单产品上传": "Skill 自动将多变体折叠为单产品，一个 1688 item = 一个 Ozon 产品卡",
+    "purchase_cost": "= 代表变体价格 + 1688 国内运费(freightCny)，已在 Skill 层完成",
+    "dimensions_单位": "mm（1688 原数据 cm → Skill ×10。Worker 再 /10 转回 cm 定价）",
+    "weight_单位": "克（直传）",
+    "图片": "images 数组至少 1 张，建议 3-10 张"
+  }
+}
