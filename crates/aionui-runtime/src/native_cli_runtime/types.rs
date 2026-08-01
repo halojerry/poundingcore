@@ -23,9 +23,11 @@ impl NativeCliToolId {
     }
 
     pub fn version(self) -> &'static str {
+        // Pinned versions — mirror pounding/scripts/vendor-versions.env
+        // (single source of truth; pounding CI runs check-version-consistency.sh).
         match self {
-            Self::Hermes => "0.18.2",
-            Self::OpenClaw => "2026.6.11",
+            Self::Hermes => "0.19.0",
+            Self::OpenClaw => "2026.6.33",
         }
     }
 
@@ -251,5 +253,18 @@ impl NativeCliToolError {
         Self {
             message: error.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pinned_versions_match_vendor_versions_env() {
+        // Mirror of pounding/scripts/vendor-versions.env — pounding CI runs
+        // scripts/check-version-consistency.sh which greps these literals.
+        assert_eq!(NativeCliToolId::Hermes.version(), "0.19.0");
+        assert_eq!(NativeCliToolId::OpenClaw.version(), "2026.6.33");
     }
 }
