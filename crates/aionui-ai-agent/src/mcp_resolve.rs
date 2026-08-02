@@ -56,7 +56,11 @@ pub async fn resolve_session_mcp_servers(
         let selected = selected_ids
             .map(|ids| ids.iter().any(|id| id == &row.id))
             .unwrap_or(row.enabled);
-        if !selected || row.builtin {
+        // POUNDING builtins (chrome-devtools / pounding-image-generation) are
+        // injected into every session when enabled; other `builtin` rows stay
+        // hidden from session injection.
+        let builtin_injected = row.builtin && aionui_mcp::BUILTIN_MCP_SERVER_NAMES.contains(&row.name.as_str());
+        if !selected || (row.builtin && !builtin_injected) {
             continue;
         }
         match row_to_session_mcp_server(&row).await {
@@ -172,4 +176,133 @@ fn parse_headers(value: Option<&serde_json::Value>) -> std::collections::HashMap
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use aionui_db::IMcpServerRepository;
+    use aionui_db::models::McpServerRow;
+    use aionui_realtime::{BroadcastEventBus, EventBroadcaster};
+    use async_trait::async_trait;
+
+    use super::*;
+
+    fn make_row(name: &str, enabled: bool, builtin: bool) -> McpServerRow {
+        // Use the test executable itself so `ensure_runtime_command` resolves
+        // it (ExplicitPath exists) instead of failing the row out.
+        let command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .into_owned();
+        McpServerRow {
+            id: format!("mcp_{name}"),
+            name: name.to_owned(),
+            description: None,
+            enabled,
+            transport_type: "stdio".into(),
+            transport_config: serde_json::json!({ "command": command, "args": [], "env": {} }).to_string(),
+            tools: None,
+            last_test_status: "disconnected".into(),
+            last_connected: None,
+            original_json: None,
+            builtin,
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    struct MockRepo {
+        rows: Vec<McpServerRow>,
+    }
+
+    #[async_trait]
+    impl IMcpServerRepository for MockRepo {
+        async fn list(&self) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
+            Ok(self.rows.clone())
+        }
+        async fn find_by_id(&self, _id: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+            unimplemented!()
+        }
+        async fn find_by_name(&self, _name: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+            unimplemented!()
+        }
+        async fn list_by_ids_any(&self, ids: &[String]) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
+            Ok(ids
+                .iter()
+                .filter_map(|id| self.rows.iter().find(|row| row.id == *id).cloned())
+                .collect())
+        }
+        async fn create(
+            &self,
+            _params: aionui_db::CreateMcpServerParams<'_>,
+        ) -> Result<McpServerRow, aionui_db::DbError> {
+            unimplemented!()
+        }
+        async fn update(
+            &self,
+            _id: &str,
+            _params: aionui_db::UpdateMcpServerParams<'_>,
+        ) -> Result<McpServerRow, aionui_db::DbError> {
+            unimplemented!()
+        }
+        async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+            unimplemented!()
+        }
+        async fn batch_upsert(
+            &self,
+            _servers: &[aionui_db::CreateMcpServerParams<'_>],
+        ) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
+            unimplemented!()
+        }
+        async fn update_status(
+            &self,
+            _id: &str,
+            _status: &str,
+            _last_connected: Option<aionui_common::TimestampMs>,
+        ) -> Result<(), aionui_db::DbError> {
+            unimplemented!()
+        }
+        async fn update_tools(&self, _id: &str, _tools: Option<&str>) -> Result<(), aionui_db::DbError> {
+            unimplemented!()
+        }
+    }
+
+    fn test_broadcaster() -> Arc<dyn EventBroadcaster> {
+        Arc::new(BroadcastEventBus::new(16))
+    }
+
+    fn names(servers: &[SessionMcpServer]) -> Vec<&str> {
+        servers.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn injects_whitelisted_builtins_and_skips_others() {
+        let repo = MockRepo {
+            rows: vec![
+                make_row("user-enabled", true, false),
+                make_row("user-disabled", false, false),
+                // Non-whitelisted builtin stays hidden from session injection.
+                make_row("other-builtin", true, true),
+                // Whitelisted builtins are injected when enabled…
+                make_row("chrome-devtools", true, true),
+                // …and skipped when disabled.
+                make_row("pounding-image-generation", false, true),
+            ],
+        };
+        let servers = resolve_session_mcp_servers(&repo, None, "conv-1", test_broadcaster()).await;
+        assert_eq!(names(&servers), vec!["user-enabled", "chrome-devtools"]);
+    }
+
+    #[tokio::test]
+    async fn frozen_selection_can_force_a_disabled_builtin() {
+        let repo = MockRepo {
+            rows: vec![make_row("pounding-image-generation", false, true)],
+        };
+        let selected = vec!["mcp_pounding-image-generation".to_owned()];
+        let servers = resolve_session_mcp_servers(&repo, Some(&selected), "conv-2", test_broadcaster()).await;
+        assert_eq!(names(&servers), vec!["pounding-image-generation"]);
+    }
 }

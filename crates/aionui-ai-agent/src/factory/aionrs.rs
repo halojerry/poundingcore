@@ -475,7 +475,11 @@ async fn load_user_mcp_servers(
         let selected = selected_ids
             .map(|ids| ids.iter().any(|id| id == &row.id))
             .unwrap_or(row.enabled);
-        if !selected || row.builtin {
+        // POUNDING builtins (chrome-devtools / pounding-image-generation) are
+        // injected into every session when enabled; other `builtin` rows stay
+        // hidden from session injection.
+        let builtin_injected = row.builtin && aionui_mcp::BUILTIN_MCP_SERVER_NAMES.contains(&row.name.as_str());
+        if !selected || (row.builtin && !builtin_injected) {
             continue;
         }
 

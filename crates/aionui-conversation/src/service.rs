@@ -1035,7 +1035,11 @@ impl ConversationService {
             };
             let selected_rows = rows
                 .into_iter()
-                .filter(|row| !row.builtin)
+                .filter(|row| {
+                    // POUNDING builtins (chrome-devtools / pounding-image-generation)
+                    // are included when enabled; other builtin rows stay hidden.
+                    !row.builtin || aionui_mcp::BUILTIN_MCP_SERVER_NAMES.contains(&row.name.as_str())
+                })
                 .filter(|row| match selected_mcp_server_ids.as_ref() {
                     Some(ids) => ids.iter().any(|id| id == &row.id),
                     None => row.enabled,
