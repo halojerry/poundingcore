@@ -19,7 +19,7 @@ batch_test               批量处理 URL 列表
 
 from __future__ import annotations
 
-import argparse, json, sys, time
+import argparse, json, os, sys, time
 from pathlib import Path
 
 # Ensure scripts/ is on sys.path
@@ -123,7 +123,12 @@ def cmd_probe(args: argparse.Namespace) -> int:
 def cmd_graph(args: argparse.Namespace) -> int:
     """组装 GraphInput envelope（1688 API + CDP → 完整请求）."""
     from scripts.lib.config_store import preflight_check, print_setup_guide, AuthError
-    from scripts.cloud_probe import build_graph_envelope_with_retry, ProductValidationError
+    try:
+        from scripts.cloud_probe import build_graph_envelope_with_retry, ProductValidationError
+    except ModuleNotFoundError:
+        print("❌ 未找到 scripts.cloud_probe（版本过旧，缺云上架模块）。"
+              "请升级：运行 `python3.12 bootstrap_update.py` 或重新下载最新包", flush=True)
+        return 1
 
     missing = preflight_check()
     if missing:
@@ -180,7 +185,12 @@ def cmd_graph(args: argparse.Namespace) -> int:
     # ✅ v0.10: 默认自动提交到 Worker（对齐 SKILL.md），--no-submit 跳过
     submit_result = None
     if not getattr(args, 'no_submit', False):
-        from scripts.cloud_probe import submit_envelope
+        try:
+            from scripts.cloud_probe import submit_envelope
+        except ModuleNotFoundError:
+            print("❌ 未找到 scripts.cloud_probe（版本过旧，缺云上架模块）。"
+                  "请升级：运行 `python3.12 bootstrap_update.py` 或重新下载最新包", flush=True)
+            return 1
         submit_result = submit_envelope(graph)
         if submit_result.get("ok"):
             import logging
@@ -390,50 +400,33 @@ def cmd_check(args) -> int:
     # 3. 1688 CDP 连通检查 + 登录检测
     # ═══════════════════════════════════════════
     alibaba_cdp_ok = False
+    login_ok = False  # ⚠️ v0.14 E4: 显式初始化（原代码 ws 分支异常时可能 NameError）
     if session_ok:
         print(f"\n  🔗 1688 CDP 连通检查...")
         try:
-            import websocket as _ws
-            import time as _time
+            from scripts.lib.cdp_client import CdpTab
 
-            _1688_ws_url = None
-            _tabs = req.get("http://127.0.0.1:9222/json", timeout=5).json()
-            for _t in _tabs:
-                if _t.get("type") == "page" and "1688.com" in _t.get("url", ""):
-                    _1688_ws_url = _t.get("webSocketDebuggerUrl", "")
-                    break
-
-            if _1688_ws_url:
-                ws = _ws.create_connection(_1688_ws_url, timeout=10)
-                ws.send(json.dumps({"id":1,"method":"Runtime.evaluate",
-                    "params":{"expression":"!!location.href && location.href.indexOf('1688.com')>=0 && location.href.indexOf('login.1688.com')<0","returnByValue":True}}))
-                ws.settimeout(8)
-                for _ in range(15):
-                    try:
-                        m = json.loads(ws.recv())
-                        if m.get("id") == 1:
-                            alibaba_cdp_ok = bool(m.get("result",{}).get("result",{}).get("value", False))
-                            break
-                    except _ws.WebSocketTimeoutException:
-                        continue
-                    except Exception:
+            # ⚠️ v0.14 E4: 复用已有 1688 tab（只读检查），替代手写 websocket + Runtime.evaluate
+            tab = None
+            try:
+                _tabs = req.get("http://127.0.0.1:9222/json", timeout=5).json()
+                for _t in _tabs:
+                    if _t.get("type") == "page" and "1688.com" in _t.get("url", ""):
+                        tab = CdpTab("http://127.0.0.1:9222", _t.get("id", ""), _t.get("webSocketDebuggerUrl", ""))
                         break
+            except Exception:
+                pass
+
+            if tab:
+                alibaba_cdp_ok = bool(tab.evaluate(
+                    "!!location.href && location.href.indexOf('1688.com')>=0 && location.href.indexOf('login.1688.com')<0"
+                ))
                 if alibaba_cdp_ok:
-                    ws.send(json.dumps({"id":2,"method":"Runtime.evaluate","params":{
-                        "expression":"document.cookie.match(/cookie2=|__cn_logon__=/) ? 'LOGGED_IN' : 'NOT_LOGGED_IN'",
-                        "returnByValue":True}}))
-                    for _ in range(15):
-                        try:
-                            m = json.loads(ws.recv())
-                            if m.get("id") == 2:
-                                val = m.get("result",{}).get("result",{}).get("value", "NOT_LOGGED_IN")
-                                login_ok = val == "LOGGED_IN"
-                                break
-                        except _ws.WebSocketTimeoutException:
-                            continue
-                        except Exception:
-                            break
-                ws.close()
+                    val = tab.evaluate(
+                        "document.cookie.match(/cookie2=|__cn_logon__=/) ? 'LOGGED_IN' : 'NOT_LOGGED_IN'"
+                    )
+                    login_ok = val == "LOGGED_IN"
+                tab.close(close_remote=False)  # 只关 WS，保留用户 1688 标签页
             else:
                 print(f"  ⚠️ 未找到已打开的 1688 标签页")
         except Exception as _dbg_e:
@@ -460,93 +453,41 @@ def cmd_check(args) -> int:
     if session_ok:
         print(f"\n  🔗 Ozon CDP 连通检查 (DataDome)...")
         try:
-            import websocket as _ws
-            import time as _time
+            from scripts.lib.cdp_client import CdpTab, CdpConnection
 
-            ws = None
-            tab_id = None
+            tab = None
             tab_is_new = False
 
-            # ✅ v0.10: 优先复用已有 ozon.ru tab（保留 cookie/session，避免 DataDome）
+            # ✅ v0.10: 优先复用已有 ozon.ru/product tab（保留 cookie/session，避免 DataDome）
+            # ⚠️ v0.14 E4: 用封装替代手写 websocket + Runtime.evaluate
             try:
                 tabs_resp = req.get("http://127.0.0.1:9222/json", timeout=5)
                 if tabs_resp.status_code == 200:
                     for t in tabs_resp.json():
                         if t.get("type") == "page" and "ozon.ru" in t.get("url", "") and "ozon.ru/product/" in t.get("url", ""):
-                            tab_id = t.get("id", "")
-                            ws_url = t.get("webSocketDebuggerUrl", "")
-                            if tab_id and ws_url:
-                                ws = _ws.create_connection(ws_url, timeout=10)
-                                # 在已有 tab 上直接检查页面内容
-                                ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
-                                    "params": {"expression": "!!(document.title && document.title.length > 5 && !document.querySelector('#datadome-captcha, iframe[src*=\"datadome\"]'))",
-                                    "returnByValue": True}}))
-                                for __ in range(15):
-                                    try:
-                                        ws.settimeout(1)
-                                        m = json.loads(ws.recv())
-                                        if m.get("id") == 1:
-                                            ozon_cdp_ok = bool(m.get("result", {}).get("result", {}).get("value", False))
-                                            break
-                                    except _ws.WebSocketTimeoutException:
-                                        continue
-                                    except Exception:
-                                        break
-                                break
+                            tab = CdpTab("http://127.0.0.1:9222", t.get("id", ""), t.get("webSocketDebuggerUrl", ""))
+                            break
             except Exception:
                 pass
 
-            # 没有已有 tab 或检查失败 → 创建新 tab
-            if ws is None:
-                blank = req.put("http://127.0.0.1:9222/json/new?", timeout=5)
-                if blank.status_code == 200:
-                    tab = blank.json()
-                    tab_id = tab.get("id", "")
-                    tab_is_new = True
-                    ws = _ws.create_connection(tab.get("webSocketDebuggerUrl", ""), timeout=10)
-                    ws.send(json.dumps({"id": 1, "method": "Page.enable", "params": {}}))
-                    ws.send(json.dumps({"id": 2, "method": "Page.navigate",
-                        "params": {"url": "https://www.ozon.ru/"}}))
-                    deadline = _time.time() + 10
-                    page_loaded = False
-                    while _time.time() < deadline:
-                        try:
-                            ws.settimeout(1)
-                            m = json.loads(ws.recv())
-                            if m.get("method") == "Page.frameStoppedLoading":
-                                page_loaded = True
-                                _time.sleep(1)
-                                break
-                        except _ws.WebSocketTimeoutException:
-                            if page_loaded:
-                                break
-                            continue
-                        except Exception:
-                            break
-                    # ✅ v0.10: 检查实际页面内容，不只是 URL
-                    ws.send(json.dumps({"id": 3, "method": "Runtime.evaluate",
-                        "params": {"expression": "!!(document.body && document.body.innerText.length > 200 && document.title.length > 5 && !document.querySelector('#datadome-captcha, iframe[src*=\"datadome\"]'))",
-                        "returnByValue": True}}))
-                    for __ in range(15):
-                        try:
-                            ws.settimeout(1)
-                            m = json.loads(ws.recv())
-                            if m.get("id") == 3:
-                                ozon_cdp_ok = bool(m.get("result", {}).get("result", {}).get("value", False))
-                                break
-                        except _ws.WebSocketTimeoutException:
-                            continue
-                        except Exception:
-                            break
-
-            if ws:
-                ws.close()
-            # 只关闭新建的 tab
-            if tab_id and tab_is_new:
+            # 没有已有 tab → 创建新 tab（仅检查后关闭，不残留）
+            if tab is None:
                 try:
-                    req.get(f"http://127.0.0.1:9222/json/close/{tab_id}", timeout=3)
+                    conn = CdpConnection("http://127.0.0.1:9222")
+                    tab = conn.new_tab("https://www.ozon.ru/")
+                    tab.wait_for_load(timeout=10)
+                    tab_is_new = True
                 except Exception:
                     pass
+
+            if tab:
+                # 检查实际页面内容（不只是 URL），含 DataDome 拦截检测
+                ozon_cdp_ok = bool(tab.evaluate(
+                    "!!(document.body && document.body.innerText.length > 200 && document.title.length > 5 "
+                    "&& !document.querySelector('#datadome-captcha, iframe[src*=\"datadome\"]'))"
+                ))
+                # 新建 tab → 全关；复用的用户 tab → 只关 WS 不关远程
+                tab.close(close_remote=tab_is_new)
         except Exception:
             pass
         print(f"  {_ok(ozon_cdp_ok)} Ozon 可通过 DataDome")
@@ -665,7 +606,12 @@ def cmd_check(args) -> int:
 def cmd_follow(args) -> int:
     """跟卖 Ozon 商品: Ozon URL → import-by-sku → 1688搜索 → CDP探针 → 上架"""
     from scripts.lib.config_store import preflight_check, print_setup_guide, AuthError
-    from scripts.cloud_probe import follow_sell_cloud
+    try:
+        from scripts.cloud_probe import follow_sell_cloud
+    except ModuleNotFoundError:
+        print("❌ 未找到 scripts.cloud_probe（版本过旧，缺云上架模块）。"
+              "请升级：运行 `python3.12 bootstrap_update.py` 或重新下载最新包", flush=True)
+        return 1
 
     missing = preflight_check()
     if missing:
@@ -904,7 +850,12 @@ def cmd_discover(args: argparse.Namespace) -> int:
         if confirm.lower() != 'y':
             print("已取消")
             return 0
-        from scripts.cloud_probe import build_envelope_from_discovery, submit_envelope
+        try:
+            from scripts.cloud_probe import build_envelope_from_discovery, submit_envelope
+        except ModuleNotFoundError:
+            print("❌ 未找到 scripts.cloud_probe（版本过旧，缺云上架模块）。"
+                  "请升级：运行 `python3.12 bootstrap_update.py` 或重新下载最新包", flush=True)
+            return 1
         from scripts.lib.config_store import get_store
 
         store = get_store(args.store or "") or {}
@@ -1037,17 +988,25 @@ def main() -> int:
 
 
 def _silent_update_check(command: str) -> None:
-    """每次命令静默检查 Skill 更新（不阻塞主流程，失败静默）。
+    """每次命令检查 Skill 更新（不阻塞主流程，失败静默）。
 
-    发现新版本时提示用户可运行 `skill update` 应用。
+    默认自动应用（v0.18.0）：有新版本即备份-覆盖-失败回滚；
+    SKILL_AUTO_UPDATE=0 时退回「提示 + 手动 skill update」模式。
     """
     if command == "update":
         return
     try:
-        from scripts.lib.updater import check_update, get_local_version
-        info = check_update()
+        from scripts.lib import updater
+        if os.environ.get("SKILL_AUTO_UPDATE", "1") != "0":
+            result = updater.auto_update_if_available()
+            if result and result.get("ok"):
+                print(f"\n✅ 已自动更新至 v{result['new_version']}，请重启终端后重新运行命令", flush=True)
+            elif result:
+                print(f"\n❌ 自动更新失败（已回滚）: {result['error']}", flush=True)
+            return
+        info = updater.check_update()
         if info:
-            print(f"\n📦 发现新版本 v{info.get('version')}（当前 v{get_local_version()}）"
+            print(f"\n📦 发现新版本 v{info.get('version')}（当前 v{updater.get_local_version()}）"
                   f"—— 运行 `skill update` 更新", flush=True)
     except Exception:
         pass
