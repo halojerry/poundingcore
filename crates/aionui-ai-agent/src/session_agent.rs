@@ -1152,6 +1152,12 @@ pub async fn build_session_instance(
         None => Vec::new(),
     };
     neutral.extend(config.session_mcp_servers.iter().cloned());
+    // Dedup by name so a builtin delivered via both the DB row path and the
+    // frontend session snapshot is injected only once.
+    {
+        let mut seen = std::collections::HashSet::new();
+        neutral.retain(|s| seen.insert(s.name.clone()));
+    }
     let mut mcp_servers: Vec<McpServerSpec> = neutral.iter().map(session_server_to_spec).collect();
     if let Some(cfg) = config.team_mcp_stdio_config.as_ref() {
         // Team-MCP is PREPENDED before the user's servers (clean-slate + legacy

@@ -13,11 +13,9 @@ use aionui_api_types::{SessionMcpServer, SessionMcpTransport};
 use aionui_common::CommandSpec;
 use aionui_db::IMcpServerRepository;
 use aionui_db::models::McpServerRow;
-use aionui_mcp::{
-    AcpMcpCapabilities, AcpSessionMcpServer, ImageGenConfig, build_builtin_image_gen_server, parse_acp_mcp_capabilities,
-};
+use aionui_mcp::{AcpMcpCapabilities, BUILTIN_MCP_SERVER_NAMES, parse_acp_mcp_capabilities};
 use aionui_runtime::{ensure_runtime_command, ensure_runtime_command_with_reporter};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::runtime_status::conversation_runtime_reporter;
 
@@ -189,64 +187,11 @@ pub(super) async fn build(
         }
     }
 
-    // ── POUNDING: Image Generation MCP ───────────────────────────────────
-    // Injected when API credentials are available from the cc-switch
-    // provider config or fallback defaults.
-    //
-    // The image-gen MCP server script (builtin-mcp-image-gen.js) is
-    // compiled from AionUi/packages/desktop/src/process/resources/builtinMcp/imageGenServer.ts
-    // and bundled alongside the backend binary.
-    if mcp_capabilities.stdio {
-        let cc_env = crate::cc_switch::read_claude_provider_env();
-        let api_key = cc_env
-            .get("ANTHROPIC_API_KEY")
-            .or_else(|| cc_env.get("OPENAI_API_KEY"))
-            .cloned();
-
-        let img_config = ImageGenConfig {
-            model: Some("gpt-image-2".into()),
-            api_url: Some("https://api.mxou.cn/v1/images/generations".into()),
-            api_key,
-            size: None,
-            quality: None,
-            style: None,
-        };
-
-        let image_gen_script = deps.data_dir.join("builtin-mcp").join("image-gen-server.js");
-        let image_gen_args = vec![image_gen_script.to_string_lossy().into_owned()];
-
-        if let Some(server) = build_builtin_image_gen_server(&mcp_capabilities, "node", image_gen_args, &img_config) {
-            match server {
-                AcpSessionMcpServer::Stdio {
-                    name,
-                    command,
-                    args,
-                    env,
-                } => {
-                    let env_vars: Vec<EnvVariable> = env
-                        .into_iter()
-                        .map(|nvp| EnvVariable::new(nvp.name, nvp.value))
-                        .collect();
-                    session_mcp_servers.push(McpServer::Stdio(
-                        McpServerStdio::new(name, std::path::PathBuf::from(command))
-                            .args(args)
-                            .env(env_vars),
-                    ));
-                    info!(ctx.conversation_id, "image_gen_mcp: injected into session");
-                }
-                _ => {
-                    debug!(
-                        ctx.conversation_id,
-                        "image_gen_mcp: unexpected server variant; skipping"
-                    );
-                }
-            }
-        } else {
-            debug!(
-                ctx.conversation_id,
-                "image_gen_mcp: skipped (capabilities mismatch or empty command)"
-            );
-        }
+    // Dedup by name so a builtin delivered via both the DB row path and the
+    // frontend session snapshot is injected only once into session/new.
+    {
+        let mut seen = std::collections::HashSet::new();
+        session_mcp_servers.retain(|s| seen.insert(mcp_server_name(s).to_owned()));
     }
 
     let params = Arc::new(
@@ -366,7 +311,8 @@ async fn resolve_agent_command_spec(
 /// When `selected_ids` is present, those rows define the session snapshot and
 /// are injected regardless of the current global `enabled` flag. Legacy
 /// conversations without a snapshot still fall back to "all enabled rows".
-/// Builtins are wired through other paths (e.g. team/guide MCP).
+/// POUNDING builtins (chrome-devtools / pounding-image-generation) are
+/// injected alongside user rows when enabled; other builtin rows are excluded.
 async fn load_user_mcp_servers(
     repo: &dyn IMcpServerRepository,
     selected_ids: Option<&[String]>,
@@ -394,7 +340,11 @@ async fn load_user_mcp_servers(
         let selected = selected_ids
             .map(|ids| ids.iter().any(|id| id == &row.id))
             .unwrap_or(row.enabled);
-        if !selected || row.builtin {
+        // POUNDING builtins (chrome-devtools / pounding-image-generation) are
+        // injected into every session when enabled; other `builtin` rows stay
+        // hidden from session injection.
+        let builtin_injected = row.builtin && BUILTIN_MCP_SERVER_NAMES.contains(&row.name.as_str());
+        if !selected || (row.builtin && !builtin_injected) {
             continue;
         }
         if !row_supported_by_capabilities(&row, capabilities) {
@@ -500,6 +450,17 @@ fn parse_headers(value: Option<&serde_json::Value>) -> Vec<HttpHeader> {
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     entries.into_iter().map(|(k, v)| HttpHeader::new(k, v)).collect()
+}
+
+/// Extract the server name from an SDK `McpServer` for dedup bookkeeping.
+/// `McpServer` is a non-exhaustive enum — the `_` arm is required.
+fn mcp_server_name(server: &McpServer) -> &str {
+    match server {
+        McpServer::Stdio(s) => &s.name,
+        McpServer::Http(s) => &s.name,
+        McpServer::Sse(s) => &s.name,
+        _ => "",
+    }
 }
 
 async fn session_server_to_sdk_mcp_server(server: &SessionMcpServer) -> Result<McpServer, String> {
@@ -983,7 +944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_user_mcp_servers_skips_disabled_and_builtin() {
+    async fn load_user_mcp_servers_injects_whitelisted_builtins_only() {
         let stdio_config = stdio_config_for_existing_command();
         let caps = AcpMcpCapabilities {
             stdio: true,
@@ -994,20 +955,29 @@ mod tests {
             rows: vec![
                 make_row("user-enabled", "stdio", &stdio_config, true, false),
                 make_row("user-disabled", "stdio", &stdio_config, false, false),
+                // Non-whitelisted builtin stays hidden from session injection.
                 make_row(
-                    "builtin",
+                    "other-builtin",
                     "stdio",
                     r#"{"command":"img-gen","args":[],"env":{}}"#,
                     true,
                     true,
                 ),
+                // Whitelisted builtins (chrome-devtools / image-gen) are injected
+                // when enabled, and skipped when disabled.
+                make_row("chrome-devtools", "stdio", &stdio_config, true, true),
+                make_row("pounding-image-generation", "stdio", &stdio_config, false, true),
             ],
             fail: false,
         });
         let servers = load_user_mcp_servers(repo.as_ref(), None, "conv-1", &caps).await;
-        assert_eq!(servers.len(), 1);
+        assert_eq!(servers.len(), 2);
         match &servers[0] {
             McpServer::Stdio(s) => assert_eq!(s.name, "user-enabled"),
+            _ => panic!("expected stdio"),
+        }
+        match &servers[1] {
+            McpServer::Stdio(s) => assert_eq!(s.name, "chrome-devtools"),
             _ => panic!("expected stdio"),
         }
     }

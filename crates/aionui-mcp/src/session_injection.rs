@@ -5,6 +5,18 @@ use serde::{Deserialize, Serialize};
 use crate::types::{McpServer, McpServerTransport};
 
 // ---------------------------------------------------------------------------
+// Builtin MCP servers
+// ---------------------------------------------------------------------------
+
+/// Names of POUNDING builtin MCP servers that are injected into every agent
+/// session when enabled in the `mcp_servers` table.
+///
+/// These are the out-of-box tools all agent CLIs must have (chrome-devtools +
+/// image generation). Other `builtin` rows (e.g. migrated legacy artifacts)
+/// remain hidden from session injection.
+pub const BUILTIN_MCP_SERVER_NAMES: &[&str] = &["chrome-devtools", "pounding-image-generation"];
+
+// ---------------------------------------------------------------------------
 // NameValuePair
 // ---------------------------------------------------------------------------
 
