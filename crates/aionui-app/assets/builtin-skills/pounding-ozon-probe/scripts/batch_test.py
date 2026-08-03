@@ -199,6 +199,11 @@ def process_ozon_url(
         else:
             os.environ.pop("OZON_API_KEY", None)
 
+        # ⚠️ v0.14 E7: follow_result/matches 可能在异常时未绑定（finally 引用会 NameError 掩盖原异常）
+        # 用 locals().get 安全读取
+        follow_result = locals().get("follow_result") or {}
+        matches = locals().get("matches") or []
+
         if not follow_result.get("success"):
             result["error"] = follow_result.get("error", "跟卖流程未找到匹配")
             print(f"  ⚠️ [{product_id}] 跟卖未找到匹配: {result['error']}", flush=True)
@@ -305,60 +310,45 @@ def main() -> int:
             issues.append("→ 启动: Chrome --remote-debugging-port=9222 --remote-allow-origins='*'")
 
     # 1688 login check via CDP cookies (not session file)
+    # ⚠️ v0.14 E4: 用 CdpTab 封装替代手写 websocket（只读检查，不关远程 tab）
     if args.type_filter in ("1688", "all") and _cdp_ok:
         try:
-            import websocket as _ws
+            from scripts.lib.cdp_client import CdpTab
             _tabs = requests.get("http://127.0.0.1:9222/json", timeout=5).json()
-            _1688_ws = None
+            tab = None
             for _t in _tabs:
                 if _t.get("type") == "page" and "1688.com" in _t.get("url", ""):
-                    _1688_ws = _t.get("webSocketDebuggerUrl", "")
+                    tab = CdpTab("http://127.0.0.1:9222", _t.get("id", ""), _t.get("webSocketDebuggerUrl", ""))
                     break
-            if _1688_ws:
-                _ws_conn = _ws.create_connection(_1688_ws, timeout=8)
-                _ws_conn.send(json.dumps({"id":1,"method":"Runtime.evaluate","params":{
-                    "expression":"document.cookie.match(/cookie2=|__cn_logon__=/) ? 'LOGGED_IN' : 'NOT_LOGGED_IN'",
-                    "returnByValue":True}}))
-                _ws_conn.settimeout(5)
-                for _ in range(10):
-                    try:
-                        m = json.loads(_ws_conn.recv())
-                        if m.get("id") == 1:
-                            if m.get("result",{}).get("result",{}).get("value","") != "LOGGED_IN":
-                                issues.append("1688 未登录 (仅影响 1688 URL)")
-                                issues.append("→ 请在 Chrome 中登录 https://login.1688.com/")
-                            break
-                    except: continue
-                _ws_conn.close()
+            if tab:
+                val = tab.evaluate(
+                    "document.cookie.match(/cookie2=|__cn_logon__=/) ? 'LOGGED_IN' : 'NOT_LOGGED_IN'",
+                    timeout=8,
+                )
+                if val != "LOGGED_IN":
+                    issues.append("1688 未登录 (仅影响 1688 URL)")
+                    issues.append("→ 请在 Chrome 中登录 https://login.1688.com/")
+                tab.close(close_remote=False)  # 只关 WS，保留用户 1688 标签页
         except Exception:
             pass  # Non-critical, actual probe will catch it
 
     # Check Ozon DataDome trust
+    # ⚠️ v0.14 E4: 用 CdpConnection 封装替代手写 websocket（新建 tab 检查后全关）
     if args.type_filter in ("ozon", "all") and cdp.get("session_available"):
         try:
-            import websocket as _ws
-            import requests as _req
-            blank_resp = _req.put("http://127.0.0.1:9222/json/new?", timeout=5)
-            if blank_resp.status_code == 200:
-                tab = blank_resp.json()
-                ws = _ws.create_connection(tab.get("webSocketDebuggerUrl", ""), timeout=8)
-                ws.send(json.dumps({"id":1,"method":"Page.enable","params":{}}))
-                ws.send(json.dumps({"id":2,"method":"Page.navigate","params":{"url":"https://www.ozon.ru/"}}))
-                import time as _t; _t.sleep(3)
-                ws.send(json.dumps({"id":3,"method":"Runtime.evaluate",
-                    "params":{"expression":"!!document.body && document.body.innerText.includes('OZON')","returnByValue":True}}))
-                for __ in range(10):
-                    ws.settimeout(2)
-                    try:
-                        m = json.loads(ws.recv())
-                        if m.get("id") == 3:
-                            if not m.get("result",{}).get("result",{}).get("value"):
-                                issues.append("Ozon 被 DataDome 拦截！需先在 Chrome 中访问 ozon.ru")
-                                issues.append("→ 打开 https://www.ozon.ru/ 浏览一个商品即可建立信任")
-                            break
-                    except:
-                        break
-                ws.close()
+            from scripts.lib.cdp_client import CdpConnection
+            conn = CdpConnection("http://127.0.0.1:9222")
+            tab = conn.new_tab("https://www.ozon.ru/")
+            tab.wait_for_load(timeout=10)
+            val = tab.evaluate(
+                "!!document.body && document.body.innerText.includes('OZON')",
+                timeout=8,
+            )
+            if not val:
+                issues.append("Ozon 被 DataDome 拦截！需先在 Chrome 中访问 ozon.ru")
+                issues.append("→ 打开 https://www.ozon.ru/ 浏览一个商品即可建立信任")
+            tab.close()  # 新建 tab → 全关，不残留
+            conn.close()
         except Exception:
             pass
 
@@ -452,10 +442,12 @@ def main() -> int:
         else:
             stats["failed"] += 1
 
-        # Save incremental results
-        log_file.write_text(
-            json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        # ⚠️ v0.14 E7: 移除循环内全量覆写（O(n²) 写入）— 改为每 5 条增量落盘一次，
+        # 最终 summary 阶段完整写一次。崩溃时最多丢最近 5 条，而非全量重写 N 次。
+        if (i + 1) % 5 == 0:
+            log_file.write_text(
+                json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
 
         # Delay between URLs
         if i < len(urls) - 1:
@@ -485,6 +477,10 @@ def main() -> int:
             for r in results
         ],
     }
+    # ⚠️ v0.14 E7: 循环结束后完整写一次 log_file（增量每 5 条 + 此处兜底，保证全量落盘）
+    log_file.write_text(
+        json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     summary_file.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )

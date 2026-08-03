@@ -2341,21 +2341,27 @@ def probe_1688_page(
         raise ConfigError('未发现可复用的 1688 浏览器会话，请先执行 browser_login 完成登录，或保持同一 profile 的 Chrome 会话可连接')
 
     # Live cookie check: verify 1688 login before navigating to product page
-    try:
-        login_ok = _check_1688_login_live(cdp_url)
-    except ConnectionError:
-        # CDP 连接断开（Chrome 死了或 tab 被关）— 重启 Chrome 而非触发登录
-        import logging as _logging
-        _logging.getLogger(__name__).warning("CDP connection died during login check, restarting Chrome...")
-        session = _resolve_browser_session.__wrapped__(profile_name) if hasattr(_resolve_browser_session, '__wrapped__') else _resolve_browser_session(profile_name)
-        cdp_url = str(session.get('cdp_url') or '').strip()
-        if not cdp_url or not _cdp_available(cdp_url):
-            raise ConfigError('Chrome CDP 连接断开且无法重启，请手动重启 Chrome')
-        login_ok = True  # 新 Chrome session 用已有 profile，cookie 有效
+    # ⚠️ v0.14 P1-6: 仅当本次调用未检测到登录态时才执行 live 检查，避免重复 CDP 页面跳转
+    # （login_detected 标志在其他路径已赋值，如 login_ok 通过的会话）
+    import logging as _logging
+    _logger_svc = _logging.getLogger(__name__)
+    if session.get('login_detected'):
+        _logger_svc.debug("已检测到登录态（login_detected），跳过 live cookie check")
+        login_ok = True
+    else:
+        try:
+            login_ok = _check_1688_login_live(cdp_url)
+        except ConnectionError:
+            # CDP 连接断开（Chrome 死了或 tab 被关）— 重启 Chrome 而非触发登录
+            _logger_svc.warning("CDP connection died during login check, restarting Chrome...")
+            session = _resolve_browser_session.__wrapped__(profile_name) if hasattr(_resolve_browser_session, '__wrapped__') else _resolve_browser_session(profile_name)
+            cdp_url = str(session.get('cdp_url') or '').strip()
+            if not cdp_url or not _cdp_available(cdp_url):
+                raise ConfigError('Chrome CDP 连接断开且无法重启，请手动重启 Chrome')
+            login_ok = True  # 新 Chrome session 用已有 profile，cookie 有效
 
     if not login_ok:
-        import logging as _logging
-        _logging.getLogger(__name__).info("1688 login not detected via live cookie check, prompting login...")
+        _logger_svc.info("1688 login not detected via live cookie check, prompting login...")
         session = _wait_for_login_session(
             target_url,
             profile_name=profile_name,
