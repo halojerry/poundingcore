@@ -431,6 +431,7 @@ async fn insert_feedback_fixture(db: &aionui_db::Database) {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind("hermes")
+    .bind("hermes")
     .bind("Hermes")
     .bind("hermes")
     .bind("acp")
