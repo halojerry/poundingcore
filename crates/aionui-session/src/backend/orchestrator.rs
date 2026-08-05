@@ -932,6 +932,7 @@ mod tests {
                         label: Some("Build".into()),
                         status: SubagentStatus::Running,
                         parent_ref: Some("toolu-1".into()),
+                        kind: None,
                     },
                 ),
                 // per-agent child detail (agentId ref) — task_status defaults Running,
@@ -951,6 +952,10 @@ mod tests {
                         tokens: Some(10),
                         tool_calls: Some(2),
                         last_tool_name: None,
+                        phase_index: None,
+                        phase_title: None,
+                        last_tool_summary: None,
+                        duration_ms: None,
                     },
                 ),
                 // container completes (terminalizes task-1, NOT agent-A).
@@ -962,6 +967,7 @@ mod tests {
                         label: None,
                         status: SubagentStatus::Completed,
                         parent_ref: Some("toolu-1".into()),
+                        kind: None,
                     },
                 ),
                 env(
@@ -1502,6 +1508,7 @@ mod tests {
                         label: Some("research".into()),
                         status: SubagentStatus::Running,
                         parent_ref: None,
+                        kind: None,
                     },
                 ),
             ]),
@@ -1568,6 +1575,7 @@ mod tests {
                         label: Some("build".into()),
                         status: SubagentStatus::Running,
                         parent_ref: None,
+                        kind: None,
                     },
                 ),
                 // the foreground turn finishes — folds Idle.
@@ -1591,6 +1599,7 @@ mod tests {
                         label: Some("build".into()),
                         status: SubagentStatus::Completed,
                         parent_ref: None,
+                        kind: None,
                     },
                 ),
             ]),
@@ -1644,6 +1653,7 @@ mod tests {
                         label: Some("Build".into()),
                         status: SubagentStatus::Running,
                         parent_ref: Some("toolu-1".into()),
+                        kind: None,
                     },
                 ),
                 // The per-agent child detail (agentId ref, distinct from the container)
@@ -1660,6 +1670,10 @@ mod tests {
                         tokens: Some(8576),
                         tool_calls: Some(0),
                         last_tool_name: None,
+                        phase_index: None,
+                        phase_title: None,
+                        last_tool_summary: None,
+                        duration_ms: None,
                     },
                 ),
                 env(
@@ -1682,6 +1696,7 @@ mod tests {
                         label: Some("Build".into()),
                         status: SubagentStatus::Completed,
                         parent_ref: Some("toolu-1".into()),
+                        kind: None,
                     },
                 ),
             ]),
@@ -1723,6 +1738,7 @@ mod tests {
                         label: None,
                         status: SubagentStatus::Running,
                         parent_ref: None,
+                        kind: None,
                     },
                 ),
                 env(
@@ -1778,6 +1794,7 @@ mod tests {
                         label: None,
                         status: SubagentStatus::Running,
                         parent_ref: None,
+                        kind: None,
                     },
                 ),
                 // The background workflow is running (has_activity true) ...
@@ -1852,6 +1869,7 @@ mod tests {
                             label: None,
                             status: SubagentStatus::Running,
                             parent_ref: None,
+                            kind: None,
                         },
                     ),
                     // The turn ends but the workflow OUTLIVES it (background_active →
@@ -1935,6 +1953,7 @@ mod tests {
                     label: None,
                     status,
                     parent_ref: None,
+                    kind: None,
                 },
             )
         };
@@ -2032,6 +2051,7 @@ mod tests {
                         label: None,
                         status: SubagentStatus::Running,
                         parent_ref: None,
+                        kind: None,
                     },
                 ),
                 env(
@@ -2042,6 +2062,7 @@ mod tests {
                         label: None,
                         status: SubagentStatus::Completed,
                         parent_ref: None,
+                        kind: None,
                     },
                 ),
                 env(
@@ -2064,6 +2085,7 @@ mod tests {
                         label: None,
                         status: SubagentStatus::Running,
                         parent_ref: None,
+                        kind: None,
                     },
                 ),
             ]),
@@ -2097,6 +2119,7 @@ mod tests {
                         label: Some("worker".into()),
                         status: SubagentStatus::Running,
                         parent_ref: None,
+                        kind: None,
                     },
                 ),
                 // park on a permission while the subagent is still running.
@@ -2121,6 +2144,7 @@ mod tests {
                         label: Some("worker".into()),
                         status: SubagentStatus::Completed,
                         parent_ref: None,
+                        kind: None,
                     },
                 ),
             ]),
@@ -2178,6 +2202,7 @@ mod tests {
                         label: None,
                         status: SubagentStatus::Running,
                         parent_ref: None,
+                        kind: None,
                     },
                 ),
                 env(
@@ -2188,6 +2213,7 @@ mod tests {
                         label: None,
                         status: SubagentStatus::Interrupted,
                         parent_ref: None,
+                        kind: None,
                     },
                 ),
             ]),
@@ -2239,6 +2265,7 @@ mod tests {
                         label: None,
                         status: SubagentStatus::Running,
                         parent_ref: None,
+                        kind: None,
                     },
                 ),
             ]),

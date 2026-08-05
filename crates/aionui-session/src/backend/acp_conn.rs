@@ -77,6 +77,14 @@ impl BackendConnection for AcpConnection {
         let logical_id = match &spec {
             SessionSpec::Fresh { session_id } => session_id.clone(),
             SessionSpec::Resume { session_id, .. } => session_id.clone(),
+            // Clean-slate ACP backend is not factory-wired yet; the live ACP
+            // fork path is AcpAgentManager's `session/fork`. Explicit reject —
+            // never silently open fresh under a fork spec.
+            SessionSpec::Fork { .. } => {
+                return Err(BackendError::Transport(
+                    "acp_conn does not support SessionSpec::Fork (use the ACP manager fork path)".into(),
+                ));
+            }
         };
 
         // Live spawn via the injected Spawner (records into the unified registry
@@ -92,7 +100,7 @@ impl BackendConnection for AcpConnection {
             .spawner
             .spawn(cmd, &[], "aionui-session")
             .await
-            .map_err(|e| BackendError::Transport(format!("acp spawn failed: {e}")))?;
+            .map_err(|e| BackendError::from_spawn("acp spawn failed", e))?;
         let io: Box<dyn AgentIo> = Box::new(crate::adapter::ManagedProcessIo::new(proc));
         // F-4 wake recipe: a Dormant→dispatch wake re-spawns the ACP CLI and
         // replays the resume handshake (`session/load` against the bound sid).
@@ -118,6 +126,8 @@ impl BackendConnection for AcpConnection {
             SessionSpec::Fresh { .. } => None,
             // lost backend session → fresh under the same logical id (§4.1).
             SessionSpec::Resume { backend_session_id, .. } => backend_session_id.clone(),
+            // Unreachable: the logical-id match above already rejected Fork.
+            SessionSpec::Fork { .. } => unreachable!("acp_conn rejects SessionSpec::Fork at open"),
         };
         backend.run_handshake(resume_sid.as_deref()).await?;
 
@@ -816,7 +826,7 @@ impl AcpSessionBackend {
         let proc = spawner
             .spawn(cmd, &[], "aionui-session")
             .await
-            .map_err(|e| BackendError::Transport(format!("acp resume-spawn failed: {e}")))?;
+            .map_err(|e| BackendError::from_spawn("acp resume-spawn failed", e))?;
         let io: Arc<dyn AgentIo> = Arc::from(Box::new(crate::adapter::ManagedProcessIo::new(proc)) as Box<dyn AgentIo>);
         let (stdin, stdout) = match io.take_stdio().await {
             Some((stdin, stdout)) => (Some(stdin), Some(stdout)),
@@ -1170,6 +1180,7 @@ async fn reader_task(ctx: ReaderCtx) {
                                         // the message + the error! log above).
                                         level: crate::event::NoticeLevel::Warning,
                                         message: format!("{label} failed: {message}"),
+                                        localized: None,
                                     },
                                 );
                             } else if let Some((kind, value)) = label.split_once('\u{2192}') {
@@ -1561,6 +1572,14 @@ async fn handle_reverse_rpc(
                     pending_perm_options.lock().await.insert(id.to_string(), parsed);
                 }
             }
+            // Carry the raised toolCall's `title` and `rawInput` so the permission
+            // card can show the approver WHAT they are approving (AionUi issue
+            // #3779 — a title-less card read as a bare "Permission request" and the
+            // user approved blind). Same wire fields `parse_permission_metadata`
+            // already reads (`toolCall.title` / `toolCall.rawInput`, ACP
+            // session/request_permission params). Display-to-the-approver, not
+            // logging — TIO-13 still applies to log output.
+            let perm_tool_call = frame.get("params").and_then(|p| p.get("toolCall"));
             emit(
                 event_tx,
                 session_id,
@@ -1569,10 +1588,11 @@ async fn handle_reverse_rpc(
                     request_id: id.to_string(),
                     kind: PermissionKind::Tool,
                     metadata,
-                    // AskUserQuestion projection is claude-direct only; ACP permission
-                    // requests carry MCP context via `metadata`, not a question payload.
-                    tool_name: None,
-                    input: None,
+                    tool_name: perm_tool_call
+                        .and_then(|tc| tc.get("title"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    input: perm_tool_call.and_then(|tc| tc.get("rawInput")).cloned(),
                 },
             );
         }
@@ -1764,6 +1784,12 @@ async fn map_update(
                 output_tokens: output,
                 total_tokens: total,
                 cost_usd,
+                // ACP spells the context window `size` (the UsageUpdate shape the
+                // frontend indicator reads back as its denominator).
+                context_window: update.get("size").and_then(Value::as_u64),
+                // ACP's UsageUpdate carries no per-turn split, so the detail
+                // line stays empty and the renderer omits it.
+                breakdown: crate::event::UsageBreakdown::default(),
             }]
         }
         "current_mode_update" => {
@@ -1942,6 +1968,10 @@ fn parse_acp_result_usage(frame: &Value) -> Option<SessionEvent> {
         output_tokens: output,
         total_tokens: total,
         cost_usd,
+        // ACP spells the context window `size` (see the notification path above).
+        context_window: usage.get("size").and_then(Value::as_u64),
+        // ACP's end-of-turn usage carries no per-turn split either.
+        breakdown: crate::event::UsageBreakdown::default(),
     })
 }
 
@@ -3410,7 +3440,7 @@ mod tests {
 
         let notice = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while let Some(env) = events.next().await {
-                if let SessionEvent::Notice { level, message } = env.event {
+                if let SessionEvent::Notice { level, message, .. } = env.event {
                     return Some((level, message));
                 }
             }
@@ -3447,7 +3477,7 @@ mod tests {
             r#"{"optionId":"ok","kind":"allow_once","name":"Allow"},"#,
             r#"{"optionId":"ok_always","kind":"allow_always","name":"Always Allow"},"#,
             r#"{"optionId":"no","kind":"reject_once","name":"Reject"}],"#,
-            r#""toolCall":{"title":"Bash","rawInput":{}}}}"#,
+            r#""toolCall":{"title":"Bash","rawInput":{"command":"rm -rf /"}}}}"#,
             "\n",
         )
         .as_bytes()
@@ -3461,10 +3491,16 @@ mod tests {
 
         // Wait for the Permission event so its request_id (the wire "501") is surfaced
         // and the offered options are stashed.
-        let req_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (req_id, perm_tool_name, perm_input) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while let Some(env) = events.next().await {
-                if let SessionEvent::Permission { request_id, .. } = env.event {
-                    return Some(request_id);
+                if let SessionEvent::Permission {
+                    request_id,
+                    tool_name,
+                    input,
+                    ..
+                } = env.event
+                {
+                    return Some((request_id, tool_name, input));
                 }
             }
             None
@@ -3472,6 +3508,15 @@ mod tests {
         .await
         .expect("must not hang")
         .expect("Permission surfaced");
+        // AionUi issue #3779: the card must show what is being approved — the
+        // toolCall's title and rawInput ride on the Permission event.
+        assert_eq!(
+            perm_tool_name.as_deref(),
+            Some("Bash"),
+            "toolCall.title rides as tool_name"
+        );
+        let perm_input = perm_input.expect("toolCall.rawInput rides as input");
+        assert_eq!(perm_input["command"], "rm -rf /", "rawInput reaches the card verbatim");
 
         // AllowAlways → must echo the real allow_always optionId "ok_always".
         backend
@@ -3634,6 +3679,7 @@ mod tests {
                 output_tokens,
                 total_tokens,
                 cost_usd,
+                ..
             } => {
                 assert_eq!(
                     *input_tokens, 0,
@@ -3667,6 +3713,7 @@ mod tests {
                 output_tokens,
                 total_tokens,
                 cost_usd,
+                ..
             }) => {
                 assert_eq!(*input_tokens, 1200);
                 assert_eq!(*output_tokens, 340);
@@ -3693,6 +3740,7 @@ mod tests {
                 output_tokens,
                 total_tokens,
                 cost_usd,
+                ..
             }) => {
                 assert_eq!((input_tokens, output_tokens, total_tokens), (900, 50, 950));
                 assert_eq!(cost_usd, Some(0.007));

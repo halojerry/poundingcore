@@ -19,7 +19,7 @@ use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;
 
-use common::{body_json, get_request, json_with_token, setup_and_login};
+use common::{body_json, get_with_token, json_with_token, setup_and_login};
 
 use aionui_app::{AppConfig, AppServices, build_module_states, create_router_with_states};
 use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService, SnapshotService};
@@ -49,13 +49,21 @@ async fn build_office_app_with_roots(
     let services = AppServices::from_config(db, &config).await.unwrap();
     let (mut states, _) = build_module_states(&services).await.expect("build module states");
 
-    states.office = build_test_office_state(tmp.path(), allowed_roots);
+    states.office = build_test_office_state(
+        tmp.path(),
+        allowed_roots,
+        std::sync::Arc::new(services.project_service.clone()),
+    );
 
     let router = create_router_with_states(&services, states);
     (router, services, tmp)
 }
 
-fn build_test_office_state(data_dir: &std::path::Path, allowed_roots: Vec<std::path::PathBuf>) -> OfficeRouterState {
+fn build_test_office_state(
+    data_dir: &std::path::Path,
+    allowed_roots: Vec<std::path::PathBuf>,
+    project: std::sync::Arc<aionui_project::ProjectService>,
+) -> OfficeRouterState {
     use aionui_office::error::OfficeError;
     use aionui_office::types::DocType;
     use aionui_office::{ProcessHandle, ProcessSpawner};
@@ -102,6 +110,7 @@ fn build_test_office_state(data_dir: &std::path::Path, allowed_roots: Vec<std::p
         conversion_service: conversion,
         proxy_service: proxy,
         allowed_roots,
+        project,
     }
 }
 
@@ -593,9 +602,12 @@ async fn dc9_invalid_conversion_target() {
 
 #[tokio::test]
 async fn rp2_ppt_proxy_ssrf_inactive_port() {
-    let (app, _services, _tmp) = build_office_app().await;
+    let (mut app, services, _tmp) = build_office_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
-    let req = get_request("/api/ppt-proxy/8080/index.html");
+    // Proxy routes require auth (preview ports are scoped to the active
+    // Core user); the SSRF port check applies to authenticated requests.
+    let req = get_with_token("/api/ppt-proxy/8080/index.html", &token);
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -605,9 +617,10 @@ async fn rp2_ppt_proxy_ssrf_inactive_port() {
 
 #[tokio::test]
 async fn rp4_office_watch_proxy_ssrf_inactive_port() {
-    let (app, _services, _tmp) = build_office_app().await;
+    let (mut app, services, _tmp) = build_office_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
-    let req = get_request("/api/office-watch-proxy/9999/index.html");
+    let req = get_with_token("/api/office-watch-proxy/9999/index.html", &token);
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -617,9 +630,10 @@ async fn rp4_office_watch_proxy_ssrf_inactive_port() {
 
 #[tokio::test]
 async fn ppt_proxy_root_path_returns_non_404() {
-    let (app, _services, _tmp) = build_office_app().await;
+    let (mut app, services, _tmp) = build_office_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
-    let req = get_request("/api/ppt-proxy/19999");
+    let req = get_with_token("/api/ppt-proxy/19999", &token);
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -627,9 +641,10 @@ async fn ppt_proxy_root_path_returns_non_404() {
 
 #[tokio::test]
 async fn office_watch_proxy_root_path_returns_non_404() {
-    let (app, _services, _tmp) = build_office_app().await;
+    let (mut app, services, _tmp) = build_office_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
 
-    let req = get_request("/api/office-watch-proxy/19999");
+    let req = get_with_token("/api/office-watch-proxy/19999", &token);
     let resp = app.oneshot(req).await.unwrap();
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);

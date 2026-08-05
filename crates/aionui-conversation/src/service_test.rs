@@ -75,27 +75,39 @@ struct StaticAssistantDispatcher {
 
 #[async_trait::async_trait]
 impl AssistantRuleDispatcher for StaticAssistantDispatcher {
-    async fn read_rule(&self, id: &str, _locale: Option<&str>) -> Result<String, ExtensionError> {
+    async fn read_rule(&self, _user_id: &str, id: &str, _locale: Option<&str>) -> Result<String, ExtensionError> {
         Ok(self.rules.get(id).cloned().unwrap_or_default())
     }
 
-    async fn write_rule(&self, _id: &str, _locale: Option<&str>, _content: &str) -> Result<(), ExtensionError> {
+    async fn write_rule(
+        &self,
+        _user_id: &str,
+        _id: &str,
+        _locale: Option<&str>,
+        _content: &str,
+    ) -> Result<(), ExtensionError> {
         Ok(())
     }
 
-    async fn delete_rule(&self, _id: &str) -> Result<bool, ExtensionError> {
+    async fn delete_rule(&self, _user_id: &str, _id: &str) -> Result<bool, ExtensionError> {
         Ok(true)
     }
 
-    async fn read_skill(&self, _id: &str, _locale: Option<&str>) -> Result<String, ExtensionError> {
+    async fn read_skill(&self, _user_id: &str, _id: &str, _locale: Option<&str>) -> Result<String, ExtensionError> {
         Ok(String::new())
     }
 
-    async fn write_skill(&self, _id: &str, _locale: Option<&str>, _content: &str) -> Result<(), ExtensionError> {
+    async fn write_skill(
+        &self,
+        _user_id: &str,
+        _id: &str,
+        _locale: Option<&str>,
+        _content: &str,
+    ) -> Result<(), ExtensionError> {
         Ok(())
     }
 
-    async fn delete_skill(&self, _id: &str) -> Result<bool, ExtensionError> {
+    async fn delete_skill(&self, _user_id: &str, _id: &str) -> Result<bool, ExtensionError> {
         Ok(true)
     }
 }
@@ -174,6 +186,7 @@ impl EventBroadcaster for MockBroadcaster {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecordedAvailabilityFailure {
+    user_id: String,
     agent_id: String,
     code: String,
     message: String,
@@ -181,19 +194,29 @@ struct RecordedAvailabilityFailure {
 
 #[derive(Default)]
 struct RecordingAvailabilityFeedback {
-    successes: Mutex<Vec<String>>,
+    successes: Mutex<Vec<(String, String)>>,
     failures: Mutex<Vec<RecordedAvailabilityFailure>>,
 }
 
 #[async_trait::async_trait]
 impl AgentAvailabilityFeedbackPort for RecordingAvailabilityFeedback {
-    async fn record_session_success(&self, agent_id: &str) -> Result<(), AgentError> {
-        self.successes.lock().unwrap().push(agent_id.to_owned());
+    async fn record_session_success(&self, user_id: &str, agent_id: &str) -> Result<(), AgentError> {
+        self.successes
+            .lock()
+            .unwrap()
+            .push((user_id.to_owned(), agent_id.to_owned()));
         Ok(())
     }
 
-    async fn record_session_failure(&self, agent_id: &str, code: &str, message: &str) -> Result<(), AgentError> {
+    async fn record_session_failure(
+        &self,
+        user_id: &str,
+        agent_id: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<(), AgentError> {
         self.failures.lock().unwrap().push(RecordedAvailabilityFailure {
+            user_id: user_id.to_owned(),
             agent_id: agent_id.to_owned(),
             code: code.to_owned(),
             message: message.to_owned(),
@@ -232,6 +255,7 @@ fn message_is_after_cursor(message: &MessageRow, cursor: &MessagePageCursor) -> 
 
 async fn repo_messages_asc(repo: &Arc<MockRepo>, conv_id: &str, limit: u32) -> Vec<MessageRow> {
     repo.list_messages_page(
+        "user_1",
         conv_id,
         &MessagePageParams {
             limit,
@@ -245,9 +269,14 @@ async fn repo_messages_asc(repo: &Arc<MockRepo>, conv_id: &str, limit: u32) -> V
 
 #[async_trait::async_trait]
 impl IConversationRepository for MockRepo {
-    async fn get(&self, id: &str) -> Result<Option<ConversationRow>, aionui_db::DbError> {
+    async fn get(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, aionui_db::DbError> {
         let rows = self.rows.lock().unwrap();
-        Ok(rows.iter().find(|r| r.id == id).cloned())
+        Ok(rows.iter().find(|r| r.user_id == user_id && r.id == id).cloned())
+    }
+
+    async fn owner_user_id(&self, id: &str) -> Result<Option<String>, aionui_db::DbError> {
+        let rows = self.rows.lock().unwrap();
+        Ok(rows.iter().find(|r| r.id == id).map(|row| row.user_id.clone()))
     }
 
     async fn create(&self, row: &ConversationRow) -> Result<(), aionui_db::DbError> {
@@ -255,11 +284,11 @@ impl IConversationRepository for MockRepo {
         Ok(())
     }
 
-    async fn update(&self, id: &str, updates: &ConversationRowUpdate) -> Result<(), aionui_db::DbError> {
+    async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), aionui_db::DbError> {
         let mut rows = self.rows.lock().unwrap();
         let row = rows
             .iter_mut()
-            .find(|r| r.id == id)
+            .find(|r| r.user_id == user_id && r.id == id)
             .ok_or_else(|| aionui_db::DbError::NotFound(format!("Conversation {id}")))?;
 
         if let Some(name) = &updates.name {
@@ -283,13 +312,22 @@ impl IConversationRepository for MockRepo {
         if let Some(updated_at) = updates.updated_at {
             row.updated_at = updated_at;
         }
+        if let Some(project_id) = &updates.project_id {
+            row.project_id = Some(project_id.clone());
+        }
+        if let Some(folder_id) = &updates.folder_id {
+            row.folder_id = Some(folder_id.clone());
+        }
+        if let Some(name_source) = &updates.name_source {
+            row.name_source = Some(name_source.clone());
+        }
         Ok(())
     }
 
-    async fn delete(&self, id: &str) -> Result<(), aionui_db::DbError> {
+    async fn delete(&self, user_id: &str, id: &str) -> Result<(), aionui_db::DbError> {
         let mut rows = self.rows.lock().unwrap();
         let len_before = rows.len();
-        rows.retain(|r| r.id != id);
+        rows.retain(|r| !(r.user_id == user_id && r.id == id));
         if rows.len() == len_before {
             return Err(aionui_db::DbError::NotFound(format!("Conversation {id}")));
         }
@@ -349,6 +387,7 @@ impl IConversationRepository for MockRepo {
 
     async fn get_assistant_snapshot(
         &self,
+        _user_id: &str,
         conversation_id: &str,
     ) -> Result<Option<ConversationAssistantSnapshotRow>, aionui_db::DbError> {
         let rows = self.assistant_snapshots.lock().unwrap();
@@ -357,6 +396,7 @@ impl IConversationRepository for MockRepo {
 
     async fn upsert_assistant_snapshot(
         &self,
+        _user_id: &str,
         params: &UpsertConversationAssistantSnapshotParams<'_>,
     ) -> Result<Option<ConversationAssistantSnapshotRow>, aionui_db::DbError> {
         let row = ConversationAssistantSnapshotRow {
@@ -386,7 +426,11 @@ impl IConversationRepository for MockRepo {
         Ok(Some(row))
     }
 
-    async fn delete_assistant_snapshot(&self, conversation_id: &str) -> Result<bool, aionui_db::DbError> {
+    async fn delete_assistant_snapshot(
+        &self,
+        _user_id: &str,
+        conversation_id: &str,
+    ) -> Result<bool, aionui_db::DbError> {
         let mut rows = self.assistant_snapshots.lock().unwrap();
         let before = rows.len();
         rows.retain(|row| row.conversation_id != conversation_id);
@@ -395,6 +439,7 @@ impl IConversationRepository for MockRepo {
 
     async fn list_messages_page(
         &self,
+        _user_id: &str,
         conv_id: &str,
         params: &MessagePageParams,
     ) -> Result<MessagePageResult, aionui_db::DbError> {
@@ -474,17 +519,23 @@ impl IConversationRepository for MockRepo {
         })
     }
 
-    async fn insert_message(&self, message: &MessageRow) -> Result<(), aionui_db::DbError> {
+    async fn insert_message(&self, _user_id: &str, message: &MessageRow) -> Result<(), aionui_db::DbError> {
         let mut messages = self.messages.lock().unwrap();
         messages.push(message.clone());
         Ok(())
     }
 
-    async fn update_message(&self, id: &str, updates: &MessageRowUpdate) -> Result<(), aionui_db::DbError> {
+    async fn update_message(
+        &self,
+        _user_id: &str,
+        conversation_id: &str,
+        id: &str,
+        updates: &MessageRowUpdate,
+    ) -> Result<(), aionui_db::DbError> {
         let mut messages = self.messages.lock().unwrap();
         let message = messages
             .iter_mut()
-            .find(|message| message.id == id)
+            .find(|message| message.conversation_id == conversation_id && message.id == id)
             .ok_or_else(|| aionui_db::DbError::NotFound(format!("Message {id}")))?;
 
         if let Some(content) = &updates.content {
@@ -499,7 +550,7 @@ impl IConversationRepository for MockRepo {
         Ok(())
     }
 
-    async fn delete_messages_by_conversation(&self, conv_id: &str) -> Result<(), aionui_db::DbError> {
+    async fn delete_messages_by_conversation(&self, _user_id: &str, conv_id: &str) -> Result<(), aionui_db::DbError> {
         self.messages
             .lock()
             .unwrap()
@@ -509,6 +560,7 @@ impl IConversationRepository for MockRepo {
 
     async fn get_message_by_msg_id(
         &self,
+        _user_id: &str,
         conv_id: &str,
         msg_id: &str,
         msg_type: &str,
@@ -524,8 +576,9 @@ impl IConversationRepository for MockRepo {
             .cloned())
     }
 
-    async fn list_stale_runtime_messages(&self) -> Result<Vec<MessageRow>, aionui_db::DbError> {
+    async fn list_stale_runtime_messages(&self) -> Result<Vec<aionui_db::StaleRuntimeMessageRow>, aionui_db::DbError> {
         let messages = self.messages.lock().unwrap();
+        let rows = self.rows.lock().unwrap();
         Ok(messages
             .iter()
             .filter(|message| {
@@ -533,7 +586,16 @@ impl IConversationRepository for MockRepo {
                     && matches!(message.status.as_deref(), Some("work" | "pending"))
                     && matches!(message.r#type.as_str(), "text" | "thinking")
             })
-            .cloned()
+            .filter_map(|message| {
+                let user_id = rows
+                    .iter()
+                    .find(|row| row.id == message.conversation_id)
+                    .map(|row| row.user_id.clone())?;
+                Some(aionui_db::StaleRuntimeMessageRow {
+                    user_id,
+                    message: message.clone(),
+                })
+            })
             .collect())
     }
 
@@ -551,7 +613,11 @@ impl IConversationRepository for MockRepo {
         })
     }
 
-    async fn list_artifacts(&self, conversation_id: &str) -> Result<Vec<ConversationArtifactRow>, aionui_db::DbError> {
+    async fn list_artifacts(
+        &self,
+        _user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<ConversationArtifactRow>, aionui_db::DbError> {
         Ok(self
             .artifacts
             .lock()
@@ -564,6 +630,7 @@ impl IConversationRepository for MockRepo {
 
     async fn get_artifact(
         &self,
+        _user_id: &str,
         conversation_id: &str,
         artifact_id: &str,
     ) -> Result<Option<ConversationArtifactRow>, aionui_db::DbError> {
@@ -578,6 +645,7 @@ impl IConversationRepository for MockRepo {
 
     async fn upsert_artifact(
         &self,
+        _user_id: &str,
         artifact: &ConversationArtifactRow,
     ) -> Result<ConversationArtifactRow, aionui_db::DbError> {
         let mut artifacts = self.artifacts.lock().unwrap();
@@ -591,6 +659,7 @@ impl IConversationRepository for MockRepo {
 
     async fn update_artifact_status(
         &self,
+        _user_id: &str,
         conversation_id: &str,
         artifact_id: &str,
         status: &str,
@@ -610,6 +679,7 @@ impl IConversationRepository for MockRepo {
 
     async fn mark_skill_suggest_artifacts_saved(
         &self,
+        _user_id: &str,
         cron_job_id: &str,
         updated_at: TimestampMs,
     ) -> Result<Vec<ConversationArtifactRow>, aionui_db::DbError> {
@@ -626,7 +696,11 @@ impl IConversationRepository for MockRepo {
         Ok(updated)
     }
 
-    async fn delete_artifacts_by_conversation(&self, conversation_id: &str) -> Result<(), aionui_db::DbError> {
+    async fn delete_artifacts_by_conversation(
+        &self,
+        _user_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), aionui_db::DbError> {
         self.artifacts
             .lock()
             .unwrap()
@@ -636,6 +710,7 @@ impl IConversationRepository for MockRepo {
 
     async fn list_legacy_cron_trigger_messages(
         &self,
+        _user_id: &str,
         conversation_id: &str,
     ) -> Result<Vec<MessageRow>, aionui_db::DbError> {
         Ok(self
@@ -669,6 +744,7 @@ fn stub_agent_metadata_rows() -> Vec<AgentMetadataRow> {
     .into_iter()
     .map(|(id, backend, agent_type, name, sort_order)| AgentMetadataRow {
         id: id.to_owned(),
+        user_id: None,
         icon: None,
         name: name.to_owned(),
         name_i18n: None,
@@ -714,8 +790,14 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
         Ok(stub_agent_metadata_rows())
     }
+    async fn list_all_for_user(&self, _user_id: &str) -> Result<Vec<AgentMetadataRow>, DbError> {
+        self.list_all().await
+    }
     async fn get(&self, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(stub_agent_metadata_rows().into_iter().find(|row| row.id == id))
+    }
+    async fn get_for_user(&self, _user_id: &str, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.get(id).await
     }
     async fn find_by_source_and_name(
         &self,
@@ -724,13 +806,35 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
     }
+    async fn find_by_source_and_name_for_user(
+        &self,
+        _user_id: &str,
+        agent_source: &str,
+        name: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.find_by_source_and_name(agent_source, name).await
+    }
     async fn find_builtin_by_backend(&self, backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(stub_agent_metadata_rows()
             .into_iter()
             .find(|row| row.agent_source == "builtin" && row.backend.as_deref() == Some(backend)))
     }
+    async fn find_builtin_by_backend_for_user(
+        &self,
+        _user_id: &str,
+        backend: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.find_builtin_by_backend(backend).await
+    }
     async fn upsert(&self, _params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
         Err(DbError::Init("stub".into()))
+    }
+    async fn upsert_for_user(
+        &self,
+        _user_id: &str,
+        params: &UpsertAgentMetadataParams<'_>,
+    ) -> Result<AgentMetadataRow, DbError> {
+        self.upsert(params).await
     }
     async fn apply_handshake(
         &self,
@@ -739,12 +843,28 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
     }
+    async fn apply_handshake_for_user(
+        &self,
+        _user_id: &str,
+        id: &str,
+        params: &UpdateAgentHandshakeParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.apply_handshake(id, params).await
+    }
     async fn update_availability_snapshot(
         &self,
         _id: &str,
         _params: &UpdateAgentAvailabilitySnapshotParams<'_>,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
+    }
+    async fn update_availability_snapshot_for_user(
+        &self,
+        _user_id: &str,
+        id: &str,
+        params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.update_availability_snapshot(id, params).await
     }
     async fn update_agent_overrides(
         &self,
@@ -754,11 +874,26 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     ) -> Result<(), DbError> {
         Ok(())
     }
+    async fn update_agent_overrides_for_user(
+        &self,
+        _user_id: &str,
+        id: &str,
+        command_override: Option<&str>,
+        env_override: Option<&str>,
+    ) -> Result<(), DbError> {
+        self.update_agent_overrides(id, command_override, env_override).await
+    }
     async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
         Ok(false)
     }
+    async fn set_enabled_for_user(&self, _user_id: &str, id: &str, enabled: bool) -> Result<bool, DbError> {
+        self.set_enabled(id, enabled).await
+    }
     async fn delete(&self, _id: &str) -> Result<bool, DbError> {
         Ok(false)
+    }
+    async fn delete_for_user(&self, _user_id: &str, id: &str) -> Result<bool, DbError> {
+        self.delete(id).await
     }
 }
 
@@ -769,6 +904,7 @@ struct ClaudeNativeSkillMetadataRepo;
 fn claude_metadata_row() -> AgentMetadataRow {
     AgentMetadataRow {
         id: "agent-claude".into(),
+        user_id: None,
         icon: None,
         name: "Claude Code".into(),
         name_i18n: None,
@@ -813,8 +949,14 @@ impl IAgentMetadataRepository for ClaudeNativeSkillMetadataRepo {
     async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
         Ok(vec![claude_metadata_row()])
     }
+    async fn list_all_for_user(&self, _user_id: &str) -> Result<Vec<AgentMetadataRow>, DbError> {
+        self.list_all().await
+    }
     async fn get(&self, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok((id == "agent-claude").then(claude_metadata_row))
+    }
+    async fn get_for_user(&self, _user_id: &str, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.get(id).await
     }
     async fn find_by_source_and_name(
         &self,
@@ -823,11 +965,33 @@ impl IAgentMetadataRepository for ClaudeNativeSkillMetadataRepo {
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok((agent_source == "builtin" && name == "Claude Code").then(claude_metadata_row))
     }
+    async fn find_by_source_and_name_for_user(
+        &self,
+        _user_id: &str,
+        agent_source: &str,
+        name: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.find_by_source_and_name(agent_source, name).await
+    }
     async fn find_builtin_by_backend(&self, backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok((backend == "claude").then(claude_metadata_row))
     }
+    async fn find_builtin_by_backend_for_user(
+        &self,
+        _user_id: &str,
+        backend: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.find_builtin_by_backend(backend).await
+    }
     async fn upsert(&self, _params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
         Err(DbError::Init("stub".into()))
+    }
+    async fn upsert_for_user(
+        &self,
+        _user_id: &str,
+        params: &UpsertAgentMetadataParams<'_>,
+    ) -> Result<AgentMetadataRow, DbError> {
+        self.upsert(params).await
     }
     async fn apply_handshake(
         &self,
@@ -836,12 +1000,28 @@ impl IAgentMetadataRepository for ClaudeNativeSkillMetadataRepo {
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
     }
+    async fn apply_handshake_for_user(
+        &self,
+        _user_id: &str,
+        id: &str,
+        params: &UpdateAgentHandshakeParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.apply_handshake(id, params).await
+    }
     async fn update_availability_snapshot(
         &self,
         _id: &str,
         _params: &UpdateAgentAvailabilitySnapshotParams<'_>,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
+    }
+    async fn update_availability_snapshot_for_user(
+        &self,
+        _user_id: &str,
+        id: &str,
+        params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.update_availability_snapshot(id, params).await
     }
     async fn update_agent_overrides(
         &self,
@@ -851,11 +1031,26 @@ impl IAgentMetadataRepository for ClaudeNativeSkillMetadataRepo {
     ) -> Result<(), DbError> {
         Ok(())
     }
+    async fn update_agent_overrides_for_user(
+        &self,
+        _user_id: &str,
+        id: &str,
+        command_override: Option<&str>,
+        env_override: Option<&str>,
+    ) -> Result<(), DbError> {
+        self.update_agent_overrides(id, command_override, env_override).await
+    }
     async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
         Ok(false)
     }
+    async fn set_enabled_for_user(&self, _user_id: &str, id: &str, enabled: bool) -> Result<bool, DbError> {
+        self.set_enabled(id, enabled).await
+    }
     async fn delete(&self, _id: &str) -> Result<bool, DbError> {
         Ok(false)
+    }
+    async fn delete_for_user(&self, _user_id: &str, id: &str) -> Result<bool, DbError> {
+        self.delete(id).await
     }
 }
 
@@ -918,6 +1113,7 @@ impl StubAcpSessionRepo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CreateAcpSessionCall {
+    user_id: String,
     conversation_id: String,
     agent_source: String,
     agent_id: String,
@@ -925,11 +1121,12 @@ struct CreateAcpSessionCall {
 
 #[async_trait::async_trait]
 impl IAcpSessionRepository for StubAcpSessionRepo {
-    async fn get(&self, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
+    async fn get_for_user(&self, _user_id: &str, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
         Ok(Some(self.row_for(conversation_id)))
     }
     async fn create(&self, params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
         self.create_calls.lock().unwrap().push(CreateAcpSessionCall {
+            user_id: params.user_id.to_owned(),
             conversation_id: params.conversation_id.to_owned(),
             agent_source: params.agent_source.to_owned(),
             agent_id: params.agent_id.to_owned(),
@@ -947,18 +1144,27 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
             suspended_at: None,
         })
     }
-    async fn update_session_id(&self, _conversation_id: &str, session_id: &str) -> Result<bool, DbError> {
+    async fn update_session_id_for_user(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        session_id: &str,
+    ) -> Result<bool, DbError> {
         *self.session_id.lock().unwrap() = Some(session_id.to_owned());
         Ok(true)
     }
-    async fn clear_session_id(&self, _conversation_id: &str) -> Result<bool, DbError> {
+    async fn clear_session_id_for_user(&self, _user_id: &str, _conversation_id: &str) -> Result<bool, DbError> {
         *self.session_id.lock().unwrap() = None;
         Ok(true)
     }
-    async fn delete(&self, _conversation_id: &str) -> Result<bool, DbError> {
+    async fn delete_for_user(&self, _user_id: &str, _conversation_id: &str) -> Result<bool, DbError> {
         Ok(false)
     }
-    async fn load_runtime_state(&self, _conversation_id: &str) -> Result<Option<PersistedSessionState>, DbError> {
+    async fn load_runtime_state_for_user(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+    ) -> Result<Option<PersistedSessionState>, DbError> {
         Ok(Some(self.runtime_state.lock().unwrap().clone().unwrap_or(
             PersistedSessionState {
                 current_model_id: Some("deepseek-v4-pro".to_owned()),
@@ -966,8 +1172,9 @@ impl IAcpSessionRepository for StubAcpSessionRepo {
             },
         )))
     }
-    async fn save_runtime_state(
+    async fn save_runtime_state_for_user(
         &self,
+        _user_id: &str,
         conversation_id: &str,
         params: &SaveRuntimeStateParams<'_>,
     ) -> Result<bool, DbError> {
@@ -1105,6 +1312,8 @@ async fn make_service_with_mock_task_manager_and_assistant_support(
 ) {
     let (svc, broadcaster, repo) = make_service_with_mock_task_manager(task_mgr);
     let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user-1").await;
+    seed_test_user(db.pool(), "user_1").await;
     let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone()));
     let overlay_repo = Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone()));
     let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
@@ -1130,6 +1339,8 @@ async fn make_service_with_assistant_support(
 ) {
     let (svc, broadcaster, repo, _task_mgr) = make_service_with_resolver(skill_resolver);
     let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user-1").await;
+    seed_test_user(db.pool(), "user_1").await;
     let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone()));
     let state_repo = Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone()));
     let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
@@ -1159,6 +1370,8 @@ async fn make_service_with_assistant_support_and_acp_session_repo(
     let (svc, broadcaster, repo, _task_mgr) =
         make_service_with_resolver_and_acp_session_repo(skill_resolver, acp_session_repo.clone());
     let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user-1").await;
+    seed_test_user(db.pool(), "user_1").await;
     let definition_repo = Arc::new(SqliteAssistantDefinitionRepository::new(db.pool().clone()));
     let state_repo = Arc::new(SqliteAssistantOverlayRepository::new(db.pool().clone()));
     let preference_repo: Arc<dyn IAssistantPreferenceRepository> =
@@ -1178,6 +1391,22 @@ async fn make_service_with_assistant_support_and_acp_session_repo(
         preference_repo,
         acp_session_repo,
     )
+}
+
+async fn seed_test_user(pool: &sqlx::SqlitePool, user_id: &str) {
+    let now = aionui_common::now_ms();
+    sqlx::query(
+        "INSERT OR IGNORE INTO users (
+            id, user_type, username, password_hash, status, session_generation, created_at, updated_at
+         ) VALUES (?, 'local', ?, 'hash', 'active', 0, ?, ?)",
+    )
+    .bind(user_id)
+    .bind(user_id)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 fn make_create_req() -> CreateConversationRequest {
@@ -1217,6 +1446,7 @@ fn unique_test_workspace_path(label: &str) -> PathBuf {
 }
 
 fn assert_dated_workspace_path(workspace_root: &Path, workspace: &Path, expected_file_name: &str) {
+    // Per-user, type-first layout: conversations/users/{user_dir}/{Y}/{M}/{D}/{leaf}
     let relative = workspace
         .strip_prefix(workspace_root.join("conversations"))
         .expect("workspace should be under the conversations root");
@@ -1225,14 +1455,20 @@ fn assert_dated_workspace_path(workspace_root: &Path, workspace: &Path, expected
         .map(|part| part.to_str().expect("workspace path should be utf-8"))
         .collect::<Vec<_>>();
 
-    assert_eq!(parts.len(), 4);
-    assert_eq!(parts[0].len(), 4);
-    assert_eq!(parts[1].len(), 2);
-    assert_eq!(parts[2].len(), 2);
-    assert!(parts[0].chars().all(|ch| ch.is_ascii_digit()));
-    assert!(parts[1].chars().all(|ch| ch.is_ascii_digit()));
+    assert_eq!(
+        parts.len(),
+        6,
+        "expected conversations/users/{{dir}}/Y/M/D/leaf, got {parts:?}"
+    );
+    assert_eq!(parts[0], "users");
+    assert!(!parts[1].is_empty(), "user dir segment must be present");
+    assert_eq!(parts[2].len(), 4);
+    assert_eq!(parts[3].len(), 2);
+    assert_eq!(parts[4].len(), 2);
     assert!(parts[2].chars().all(|ch| ch.is_ascii_digit()));
-    assert_eq!(parts[3], expected_file_name);
+    assert!(parts[3].chars().all(|ch| ch.is_ascii_digit()));
+    assert!(parts[4].chars().all(|ch| ch.is_ascii_digit()));
+    assert_eq!(parts[5], expected_file_name);
 }
 
 async fn upsert_test_assistant_definition(
@@ -1357,9 +1593,189 @@ async fn insert_conversation_with_type(repo: &Arc<MockRepo>, user_id: &str, agen
         pinned_at: None,
         created_at: 1,
         updated_at: 1,
+        project_id: None,
+        folder_id: None,
+        name_source: None,
     };
     repo.create(&row).await.unwrap();
     row
+}
+
+// ── apply_agent_title guard matrix ─────────────────────────────────
+
+async fn seed_titled_conversation(
+    repo: &Arc<MockRepo>,
+    user_id: &str,
+    name: &str,
+    name_source: Option<&str>,
+) -> String {
+    let mut row = insert_conversation_with_type(repo, user_id, AgentType::Acp).await;
+    row.name = name.to_owned();
+    row.name_source = name_source.map(str::to_owned);
+    // MockRepo::create pushed the original row; rewrite it via update.
+    repo.update(
+        user_id,
+        &row.id,
+        &ConversationRowUpdate {
+            name: Some(row.name.clone()),
+            name_source: row.name_source.clone(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    row.id
+}
+
+async fn get_row(repo: &Arc<MockRepo>, user_id: &str, id: &str) -> ConversationRow {
+    use aionui_db::IConversationRepository as _;
+    repo.get(user_id, id).await.unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn agent_title_applies_to_default_named_conversation() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let id = seed_titled_conversation(&repo, "user_1", "first message placeholder", None).await;
+
+    let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Fix login bug")
+        .await
+        .unwrap();
+
+    assert!(applied);
+    let row = get_row(&repo, "user_1", &id).await;
+    assert_eq!(row.name, "Fix login bug");
+    assert_eq!(row.name_source.as_deref(), Some("agent"));
+
+    let events = broadcaster.take_events();
+    let event = events
+        .iter()
+        .find(|e| e.name == "conversation.nameUpdated")
+        .expect("nameUpdated event broadcast");
+    assert_eq!(event.data["conversation_id"], id);
+    assert_eq!(event.data["name"], "Fix login bug");
+    assert_eq!(event.data["user_id"], "user_1");
+}
+
+#[tokio::test]
+async fn agent_title_overwrites_previous_agent_title() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let id = seed_titled_conversation(&repo, "user_1", "Old agent title", Some("agent")).await;
+
+    let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Newer agent title")
+        .await
+        .unwrap();
+
+    assert!(applied);
+    assert_eq!(get_row(&repo, "user_1", &id).await.name, "Newer agent title");
+}
+
+#[tokio::test]
+async fn agent_title_never_overwrites_user_rename() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let id = seed_titled_conversation(&repo, "user_1", "My careful name", Some("user")).await;
+
+    let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Agent title")
+        .await
+        .unwrap();
+
+    assert!(!applied);
+    let row = get_row(&repo, "user_1", &id).await;
+    assert_eq!(row.name, "My careful name");
+    assert_eq!(row.name_source.as_deref(), Some("user"));
+    assert!(
+        !broadcaster
+            .take_events()
+            .iter()
+            .any(|e| e.name == "conversation.nameUpdated"),
+        "discarded title must not broadcast"
+    );
+}
+
+#[tokio::test]
+async fn agent_title_unchanged_is_noop() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let id = seed_titled_conversation(&repo, "user_1", "Same title", Some("agent")).await;
+
+    let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", &id, "Same title")
+        .await
+        .unwrap();
+
+    assert!(!applied);
+    assert!(
+        !broadcaster
+            .take_events()
+            .iter()
+            .any(|e| e.name == "conversation.nameUpdated")
+    );
+}
+
+#[tokio::test]
+async fn agent_title_ignores_unknown_conversation() {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+
+    let repo_dyn: Arc<dyn IConversationRepository> = repo.clone();
+    let broadcaster_dyn: Arc<dyn EventBroadcaster> = broadcaster.clone();
+    let applied = crate::service::apply_agent_title(&repo_dyn, &broadcaster_dyn, "user_1", "missing", "Title")
+        .await
+        .unwrap();
+
+    assert!(!applied);
+}
+
+// ── update_conversation name_source intent ─────────────────────────
+
+#[tokio::test]
+async fn update_name_without_source_marks_user() {
+    let (svc, _broadcaster, repo, task_mgr) = make_service();
+    let row = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+
+    let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "Renamed by hand" })).unwrap();
+    svc.update("user_1", &row.id, req, &task_mgr).await.unwrap();
+
+    let updated = get_row(&repo, "user_1", &row.id).await;
+    assert_eq!(updated.name, "Renamed by hand");
+    assert_eq!(updated.name_source.as_deref(), Some("user"));
+}
+
+#[tokio::test]
+async fn update_name_with_auto_source_keeps_origin() {
+    let (svc, _broadcaster, repo, task_mgr) = make_service();
+    let row = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+
+    let req: UpdateConversationRequest =
+        serde_json::from_value(json!({ "name": "Derived title", "name_source": "auto" })).unwrap();
+    svc.update("user_1", &row.id, req, &task_mgr).await.unwrap();
+
+    let updated = get_row(&repo, "user_1", &row.id).await;
+    assert_eq!(updated.name, "Derived title");
+    assert_eq!(updated.name_source, None, "auto rename must stay agent-overwritable");
+}
+
+#[tokio::test]
+async fn update_without_name_leaves_name_source_untouched() {
+    let (svc, _broadcaster, repo, task_mgr) = make_service();
+    let id = seed_titled_conversation(&repo, "user_1", "Agent title", Some("agent")).await;
+
+    let req: UpdateConversationRequest = serde_json::from_value(json!({ "pinned": true })).unwrap();
+    svc.update("user_1", &id, req, &task_mgr).await.unwrap();
+
+    assert_eq!(
+        get_row(&repo, "user_1", &id).await.name_source.as_deref(),
+        Some("agent")
+    );
 }
 
 // ── Create tests ───────────────────────────────────────────────────
@@ -1388,6 +1804,106 @@ async fn create_returns_conversation_with_defaults() {
     assert_eq!(events[0].data["action"], "created");
     assert_eq!(events[0].data["conversation_id"], resp.id);
     assert_eq!(events[0].data["source"], "aionui");
+}
+
+// ── Project-bind side branch tests ─────────────────────────────────
+
+async fn make_injected_project_service(temp_root: &std::path::Path) -> std::sync::Arc<aionui_project::ProjectService> {
+    // A real store on an in-memory DB; temp_root mirrors the app wiring
+    // (`work_dir/conversations`) so classification matches production. The
+    // Database handle is leaked so the shared in-memory pool outlives the test.
+    let db = aionui_db::init_database_memory().await.unwrap();
+    // The project tables carry a users(id) FK; seed the owner these tests act
+    // as, mirroring production where the owner always exists.
+    sqlx::query(
+        "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+         VALUES ('user_1', 'local', 'user_1', 'hash', 'active', 0, 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let store: std::sync::Arc<dyn aionui_db::IProjectStore> =
+        std::sync::Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone()));
+    std::mem::forget(db);
+    std::sync::Arc::new(aionui_project::ProjectService::new(
+        store,
+        temp_root.join("conversations"),
+    ))
+}
+
+#[tokio::test]
+async fn create_side_branch_backfills_project_binding_when_injected() {
+    let work_root = tempfile::tempdir().unwrap();
+    let (svc, _bc, repo, _task_mgr) = make_service_with_workspace_root(work_root.path().to_path_buf());
+    svc.with_project_service(make_injected_project_service(work_root.path()).await);
+
+    // Custom workspace outside temp_root → classified standard.
+    let ws = tempfile::tempdir().unwrap();
+    let mut req = make_create_req();
+    req.extra = json!({ "workspace": ws.path().to_string_lossy(), "backend": "claude" });
+
+    let resp = svc.create("user_1", req).await.unwrap();
+
+    let row = repo.get("user_1", &resp.id).await.unwrap().unwrap();
+    assert!(
+        row.project_id.is_some(),
+        "create side branch should backfill project_id"
+    );
+    assert!(row.folder_id.is_some(), "create side branch should backfill folder_id");
+    // The transitional workspace string must be untouched by the side branch.
+    assert_eq!(resp.extra["workspace"], ws.path().to_string_lossy().as_ref());
+}
+
+#[tokio::test]
+async fn create_without_project_service_leaves_binding_null() {
+    // Best-effort contract: no ProjectService injected → binding stays NULL and
+    // create still succeeds (the side branch is a pure no-op).
+    let (svc, _bc, repo, _task_mgr) = make_service();
+    let resp = svc.create("user_1", make_create_req()).await.unwrap();
+    let row = repo.get("user_1", &resp.id).await.unwrap().unwrap();
+    assert!(row.project_id.is_none());
+    assert!(row.folder_id.is_none());
+}
+
+#[tokio::test]
+async fn list_does_not_backfill_but_get_does() {
+    let work_root = tempfile::tempdir().unwrap();
+    let (svc, _bc, repo, _task_mgr) = make_service_with_workspace_root(work_root.path().to_path_buf());
+
+    // Create WITHOUT the project service so the row starts unbound.
+    let ws = tempfile::tempdir().unwrap();
+    let mut req = make_create_req();
+    req.extra = json!({ "workspace": ws.path().to_string_lossy(), "backend": "claude" });
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert!(
+        repo.get("user_1", &resp.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .project_id
+            .is_none()
+    );
+
+    svc.with_project_service(make_injected_project_service(work_root.path()).await);
+
+    // Narrowed contract: list is a pure read — it must NOT backfill, so the
+    // conversation list stays fast and side-effect free.
+    let _ = svc.list("user_1", ListConversationsQuery::default()).await.unwrap();
+    assert!(
+        repo.get("user_1", &resp.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .project_id
+            .is_none(),
+        "list must not backfill"
+    );
+
+    // Opening the single conversation via get → lazy backfill.
+    let _ = svc.get("user_1", &resp.id).await.unwrap();
+    let row = repo.get("user_1", &resp.id).await.unwrap().unwrap();
+    assert!(row.project_id.is_some(), "get should lazily backfill project_id");
+    assert!(row.folder_id.is_some());
 }
 
 #[tokio::test]
@@ -1443,7 +1959,7 @@ fn create_team_temp_workspace_uses_date_partition() {
     let workspace_root = temp.path().join("aionui-data");
     let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_workspace_root(workspace_root.clone());
 
-    let workspace = svc.create_team_temp_workspace("team_1").unwrap();
+    let workspace = svc.create_team_temp_workspace("user_1", "team_1").unwrap();
 
     let workspace = Path::new(&workspace);
     assert_dated_workspace_path(&workspace_root, workspace, "team-temp-team_1");
@@ -1598,7 +2114,7 @@ async fn create_derives_aionrs_type_from_assistant_backend_when_type_is_missing(
 
     let resp = svc.create("user_1", req).await.unwrap();
     assert_eq!(resp.r#type, AgentType::Aionrs);
-    assert!(repo.get_assistant_snapshot(&resp.id).await.unwrap().is_some());
+    assert!(repo.get_assistant_snapshot("user_1", &resp.id).await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -1644,7 +2160,7 @@ async fn create_derives_acp_type_from_assistant_backend_when_type_is_missing() {
 
     let resp = svc.create("user_1", req).await.unwrap();
     assert_eq!(resp.r#type, AgentType::Acp);
-    assert!(repo.get_assistant_snapshot(&resp.id).await.unwrap().is_some());
+    assert!(repo.get_assistant_snapshot("user_1", &resp.id).await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -1692,7 +2208,7 @@ async fn create_derives_acp_type_from_openclaw_agent_metadata_when_type_is_missi
     assert_eq!(resp.r#type, AgentType::Acp);
     assert_eq!(resp.extra["agent_id"], json!("b7e8a9c4"));
     assert_eq!(resp.extra["backend"], json!("openclaw"));
-    assert!(repo.get_assistant_snapshot(&resp.id).await.unwrap().is_some());
+    assert!(repo.get_assistant_snapshot("user_1", &resp.id).await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -1741,7 +2257,7 @@ async fn create_derives_acp_type_from_custom_agent_metadata_when_type_is_missing
     assert_eq!(resp.extra["agent_id"], json!("custom-acp-1"));
     assert_eq!(resp.extra["agent_source"], json!("custom"));
     assert_eq!(resp.extra["backend"], json!("acp"));
-    assert!(repo.get_assistant_snapshot(&resp.id).await.unwrap().is_some());
+    assert!(repo.get_assistant_snapshot("user_1", &resp.id).await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -1862,6 +2378,7 @@ async fn get_reports_idle_runtime_when_only_persisted_status_is_running() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
     let created = svc.create("user_1", make_create_req()).await.unwrap();
     repo.update(
+        "user_1",
         &created.id,
         &ConversationRowUpdate {
             status: Some("running".into()),
@@ -2105,8 +2622,8 @@ async fn delete_invokes_registered_hook() {
     struct RecordingHook(Mutex<Vec<String>>);
     #[async_trait::async_trait]
     impl OnConversationDelete for RecordingHook {
-        async fn on_conversation_deleted(&self, conversation_id: &str) {
-            self.0.lock().unwrap().push(conversation_id.to_owned());
+        async fn on_conversation_deleted(&self, user_id: &str, conversation_id: &str) {
+            self.0.lock().unwrap().push(format!("{user_id}:{conversation_id}"));
         }
     }
 
@@ -2118,7 +2635,7 @@ async fn delete_invokes_registered_hook() {
     svc.delete("user_1", &conv.id).await.unwrap();
 
     let calls = hook.0.lock().unwrap();
-    assert_eq!(calls.as_slice(), &[conv.id]);
+    assert_eq!(calls.as_slice(), &[format!("user_1:{}", conv.id)]);
 }
 
 #[tokio::test]
@@ -2132,8 +2649,8 @@ async fn delete_invokes_registered_hook_before_row_delete() {
 
     #[async_trait::async_trait]
     impl OnConversationDelete for RowVisibleHook {
-        async fn on_conversation_deleted(&self, conversation_id: &str) {
-            let exists = self.repo.get(conversation_id).await.unwrap().is_some();
+        async fn on_conversation_deleted(&self, user_id: &str, conversation_id: &str) {
+            let exists = self.repo.get(user_id, conversation_id).await.unwrap().is_some();
             self.observations.lock().unwrap().push(exists);
         }
     }
@@ -2152,7 +2669,7 @@ async fn delete_invokes_registered_hook_before_row_delete() {
         let observations = hook.observations.lock().unwrap();
         assert_eq!(observations.as_slice(), &[true]);
     }
-    assert!(repo.get(&conv.id).await.unwrap().is_none());
+    assert!(repo.get("user_1", &conv.id).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -2351,22 +2868,25 @@ async fn reset_sets_status_to_pending() {
 async fn reset_clears_conversation_artifacts() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    repo.upsert_artifact(&ConversationArtifactRow {
-        id: format!("{}:skill_suggest:cron_1", conv.id),
-        conversation_id: conv.id.clone(),
-        cron_job_id: Some("cron_1".into()),
-        kind: "skill_suggest".into(),
-        status: "pending".into(),
-        payload: json!({ "cron_job_id": "cron_1", "name": "daily-report" }).to_string(),
-        created_at: 1000,
-        updated_at: 1000,
-    })
+    repo.upsert_artifact(
+        "user_1",
+        &ConversationArtifactRow {
+            id: format!("{}:skill_suggest:cron_1", conv.id),
+            conversation_id: conv.id.clone(),
+            cron_job_id: Some("cron_1".into()),
+            kind: "skill_suggest".into(),
+            status: "pending".into(),
+            payload: json!({ "cron_job_id": "cron_1", "name": "daily-report" }).to_string(),
+            created_at: 1000,
+            updated_at: 1000,
+        },
+    )
     .await
     .unwrap();
 
     svc.reset("user_1", &conv.id).await.unwrap();
 
-    let artifacts = repo.list_artifacts(&conv.id).await.unwrap();
+    let artifacts = repo.list_artifacts("user_1", &conv.id).await.unwrap();
     assert!(artifacts.is_empty());
 }
 
@@ -2374,22 +2894,26 @@ async fn reset_clears_conversation_artifacts() {
 async fn list_artifacts_includes_legacy_cron_trigger_messages() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    repo.insert_message(&MessageRow {
-        id: "legacy-msg-1".into(),
-        conversation_id: conv.id.clone(),
-        msg_id: Some("legacy-trigger-1".into()),
-        r#type: "cron_trigger".into(),
-        content: json!({
-            "cron_job_id": "cron_1",
-            "cron_job_name": "Daily Report",
-            "triggered_at": 1234
-        })
-        .to_string(),
-        position: Some("center".into()),
-        status: Some("finish".into()),
-        hidden: false,
-        created_at: 1234,
-    })
+    repo.insert_message(
+        "user_1",
+        &MessageRow {
+            id: "legacy-msg-1".into(),
+            conversation_id: conv.id.clone(),
+            msg_id: Some("legacy-trigger-1".into()),
+            r#type: "cron_trigger".into(),
+            content: json!({
+                "cron_job_id": "cron_1",
+                "cron_job_name": "Daily Report",
+                "triggered_at": 1234
+            })
+            .to_string(),
+            position: Some("center".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 1234,
+            backend_turn_id: None,
+        },
+    )
     .await
     .unwrap();
 
@@ -2667,30 +3191,14 @@ impl IMockAgent for MockAgent {
         })
     }
 
-    // POUNDING redirects both the dedicated `set_mode` endpoint and
-    // `set_config_option("mode", ...)` to `task.set_mode()`. The mock must
-    // model a mode-capable agent (like the real ACP task) rather than fall
-    // back to the erroring trait default, otherwise every mode switch fails.
-    async fn set_mode(&self, mode: &str) -> Result<(), AgentError> {
-        *self.mode.lock().unwrap() = mode.to_owned();
-        Ok(())
-    }
-
+    // POUNDING routes both the dedicated `set_mode` endpoint and
+    // `set_config_option("mode", ...)` to the config-option chokepoint, so the
+    // mock models mode/model via `set_config_option` (below) rather than the
+    // pre-sync dedicated `set_mode`/`set_model` trait hooks, which upstream
+    // removed from `IMockAgent`.
     async fn get_model(&self) -> Result<GetModelInfoResponse, AgentError> {
         let current = self.model_id.lock().unwrap().clone();
         Ok(Self::build_model_response(&current))
-    }
-
-    async fn set_model(&self, model_id: &str) -> Result<(), AgentError> {
-        if !self.keep_reported_model_on_set {
-            *self.model_id.lock().unwrap() = model_id.to_owned();
-        }
-        Ok(())
-    }
-
-    async fn set_model_confirmed(&self, model_id: &str) -> Result<GetModelInfoResponse, AgentError> {
-        self.set_model(model_id).await?;
-        Ok(Self::build_model_response(model_id))
     }
 
     async fn get_config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
@@ -2706,6 +3214,9 @@ impl IMockAgent for MockAgent {
             .push((option_id.to_owned(), value.to_owned()));
         if option_id == "mode" {
             *self.mode.lock().unwrap() = value.to_owned();
+        }
+        if option_id == "model" && !self.keep_reported_model_on_set {
+            *self.model_id.lock().unwrap() = value.to_owned();
         }
         if let Some(error) = self.set_config_option_error.lock().unwrap().take() {
             return Err(error);
@@ -3127,6 +3638,10 @@ impl IWorkerTaskManager for MockTaskManager {
         self.agents.lock().unwrap().len()
     }
 
+    fn active_conversation_ids(&self) -> Vec<String> {
+        self.agents.lock().unwrap().keys().cloned().collect()
+    }
+
     fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
         vec![]
     }
@@ -3247,6 +3762,10 @@ impl IWorkerTaskManager for MockTaskManagerWithWorkspace {
 
     fn active_count(&self) -> usize {
         self.agents.lock().unwrap().len()
+    }
+
+    fn active_conversation_ids(&self) -> Vec<String> {
+        self.agents.lock().unwrap().keys().cloned().collect()
     }
 
     fn collect_idle(&self, _idle_threshold_ms: TimestampMs) -> Vec<String> {
@@ -3574,6 +4093,7 @@ async fn set_mode_returns_confirmed_mode_from_active_agent() {
 
     let response = svc
         .set_mode(
+            "user_1",
             &conv.id,
             SetModeRequest {
                 mode: "plan".to_owned(),
@@ -3584,6 +4104,95 @@ async fn set_mode_returns_confirmed_mode_from_active_agent() {
 
     assert_eq!(response.mode, "plan");
     assert!(response.initialized);
+}
+
+#[tokio::test]
+async fn get_config_options_returns_active_agent_snapshot() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = MockAgent::new(&conv.id).with_config_options(vec![AcpConfigOptionDto {
+        id: "model".to_owned(),
+        name: Some("Model".to_owned()),
+        label: None,
+        description: None,
+        category: Some("model".to_owned()),
+        option_type: "select".to_owned(),
+        current_value: Some("gpt-5.5".to_owned()),
+        options: Vec::new(),
+    }]);
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(agent)));
+
+    let result = svc.get_config_options("user_1", &conv.id).await.unwrap();
+
+    assert_eq!(result.config_options[0].id, "model");
+    assert_eq!(result.config_options[0].current_value.as_deref(), Some("gpt-5.5"));
+}
+
+#[tokio::test]
+async fn get_config_options_rejects_cross_user_active_task() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = MockAgent::new(&conv.id);
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(agent)));
+
+    let err = svc.get_config_options("user_2", &conv.id).await.unwrap_err();
+
+    assert!(matches!(err, ConversationError::NotFound { id } if id == conv.id));
+}
+
+#[tokio::test]
+async fn active_count_for_user_counts_only_owned_active_tasks() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let user_1_conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let user_2_conv = svc.create("user_2", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(
+        &user_1_conv.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&user_1_conv.id))),
+    );
+    task_mgr.insert_agent(
+        &user_2_conv.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&user_2_conv.id))),
+    );
+
+    assert_eq!(svc.active_count_for_user("user_1").await.unwrap(), 1);
+    assert_eq!(svc.active_count_for_user("user_2").await.unwrap(), 1);
+    assert_eq!(svc.active_count_for_user("user_3").await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn terminate_runtime_for_user_kills_only_owned_active_tasks() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let user_1_conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let user_2_conv = svc.create("user_2", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(
+        &user_1_conv.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&user_1_conv.id))),
+    );
+    task_mgr.insert_agent(
+        &user_2_conv.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&user_2_conv.id))),
+    );
+    let runtime_state = svc.runtime_state();
+    let _claim = runtime_state
+        .try_claim_turn(&user_1_conv.id, "turn-1")
+        .expect("claim should be created");
+    runtime_state.mark_cancelling(&user_1_conv.id);
+
+    let terminated = svc.terminate_runtime_for_user("user_1").await.unwrap();
+
+    assert_eq!(terminated, 1);
+    assert_eq!(
+        task_mgr.kill_records(),
+        vec![(user_1_conv.id.clone(), Some(AgentKillReason::SessionRevoked))]
+    );
+    assert!(!runtime_state.is_claimed(&user_1_conv.id));
+    assert!(!runtime_state.is_cancelling(&user_1_conv.id));
+    assert_eq!(task_mgr.active_count(), 1);
+    assert!(task_mgr.get_task(&user_2_conv.id).is_some());
 }
 
 #[tokio::test]
@@ -3683,6 +4292,7 @@ async fn set_config_option_returns_observed_confirmation() {
 
     let result = svc
         .set_config_option(
+            "user_1",
             &conv.id,
             "reasoning_effort",
             SetConfigOptionRequest {
@@ -3709,6 +4319,7 @@ async fn set_model_returns_confirmed_model_from_active_agent() {
 
     let response = svc
         .set_model(
+            "user_1",
             &conv.id,
             SetModelRequest {
                 model_id: "model-b".to_owned(),
@@ -3733,6 +4344,7 @@ async fn set_model_returns_confirmed_model_even_if_get_model_is_stale() {
 
     let response = svc
         .set_model(
+            "user_1",
             &conv.id,
             SetModelRequest {
                 model_id: "model-b".to_owned(),
@@ -3772,11 +4384,15 @@ async fn save_acp_runtime_mode_updates_runtime_mode_config_selection() {
         ),
         context_usage_json: None,
     }));
-    let (svc, _, _, _) = make_service_with_resolver_and_acp_session_repo(
+    let (svc, _, repo, _) = make_service_with_resolver_and_acp_session_repo(
         Arc::new(FixedSkillResolver { names: vec![] }),
         acp_repo.clone(),
     );
-    svc.save_acp_runtime_mode("conv_1", "full-access").await.unwrap();
+    let conv = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+
+    svc.save_acp_runtime_mode("user_1", &conv.id, "full-access")
+        .await
+        .unwrap();
 
     let saves = acp_repo.runtime_state_saves();
     assert_eq!(saves.len(), 1);
@@ -3786,6 +4402,27 @@ async fn save_acp_runtime_mode_updates_runtime_mode_config_selection() {
     assert_eq!(selections["mode"], "full-access");
     assert_eq!(selections["model"], "gpt-5.3-codex");
     assert_eq!(selections["reasoning_effort"], "low");
+}
+
+#[tokio::test]
+async fn save_acp_runtime_mode_rejects_wrong_user() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::with_runtime_state(PersistedSessionState {
+        current_mode_id: Some("read-only".to_owned()),
+        ..Default::default()
+    }));
+    let (svc, _, repo, _) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_repo.clone(),
+    );
+    let conv = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+
+    let err = svc
+        .save_acp_runtime_mode("user_2", &conv.id, "full-access")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ConversationError::NotFound { .. }));
+    assert!(acp_repo.runtime_state_saves().is_empty());
 }
 
 #[tokio::test]
@@ -3852,6 +4489,7 @@ async fn set_config_option_evicts_task_when_acp_protocol_is_not_connected() {
 
     let err = svc
         .set_config_option(
+            "user_1",
             &conv.id,
             // POUNDING redirects "model"/"mode" to dedicated CC-Switch
             // endpoints. The NotConnected-driven task eviction lives only in
@@ -3890,6 +4528,7 @@ async fn command_ack_does_not_persist_assistant_preference_in_core_service() {
 
     let result = svc
         .set_config_option(
+            "user_1",
             &conv.id,
             // POUNDING routes "model"/"mode" to dedicated CC-Switch endpoints
             // (set_model_confirmed/set_mode, always Observed). Use a generic
@@ -3956,6 +4595,7 @@ async fn set_model_updates_assistant_preference_only_when_snapshot_model_mode_is
 
     let response = svc
         .set_model(
+            "user_1",
             &auto_conv.id,
             SetModelRequest {
                 model_id: "model-b".to_owned(),
@@ -3973,7 +4613,11 @@ async fn set_model_updates_assistant_preference_only_when_snapshot_model_mode_is
     );
     let auto_pref = preference_repo.get("asstdef_model_auto").await.unwrap().unwrap();
     assert_eq!(auto_pref.last_model_id.as_deref(), Some("model-b"));
-    let auto_snapshot = repo.get_assistant_snapshot(&auto_conv.id).await.unwrap().unwrap();
+    let auto_snapshot = repo
+        .get_assistant_snapshot("user_1", &auto_conv.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(auto_snapshot.resolved_model_id.as_deref(), Some("model-b"));
 
     upsert_test_assistant_definition(
@@ -4017,6 +4661,7 @@ async fn set_model_updates_assistant_preference_only_when_snapshot_model_mode_is
 
     let _ = svc
         .set_model(
+            "user_1",
             &fixed_conv.id,
             SetModelRequest {
                 model_id: "model-c".to_owned(),
@@ -4027,7 +4672,11 @@ async fn set_model_updates_assistant_preference_only_when_snapshot_model_mode_is
 
     let fixed_pref = preference_repo.get("asstdef_model_fixed").await.unwrap().unwrap();
     assert_eq!(fixed_pref.last_model_id.as_deref(), Some("legacy-fixed-model"));
-    let fixed_snapshot = repo.get_assistant_snapshot(&fixed_conv.id).await.unwrap().unwrap();
+    let fixed_snapshot = repo
+        .get_assistant_snapshot("user_1", &fixed_conv.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(fixed_snapshot.resolved_model_id.as_deref(), Some("model-c"));
 }
 
@@ -4057,15 +4706,18 @@ async fn set_mode_updates_assistant_preference_only_when_snapshot_permission_mod
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_mode_auto",
-            last_model_id: None,
-            last_permission_value: Some("legacy-mode"),
-            last_thought_level_value: None,
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_mode_auto",
+                last_model_id: None,
+                last_permission_value: Some("legacy-mode"),
+                last_thought_level_value: None,
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -4078,6 +4730,7 @@ async fn set_mode_updates_assistant_preference_only_when_snapshot_permission_mod
 
     let response = svc
         .set_mode(
+            "user_1",
             &auto_conv.id,
             SetModeRequest {
                 mode: "plan".to_owned(),
@@ -4087,9 +4740,17 @@ async fn set_mode_updates_assistant_preference_only_when_snapshot_permission_mod
         .unwrap();
 
     assert_eq!(response.mode, "plan");
-    let auto_pref = preference_repo.get("asstdef_mode_auto").await.unwrap().unwrap();
+    let auto_pref = preference_repo
+        .get_for_user("user_1", "asstdef_mode_auto")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(auto_pref.last_permission_value.as_deref(), Some("plan"));
-    let auto_snapshot = repo.get_assistant_snapshot(&auto_conv.id).await.unwrap().unwrap();
+    let auto_snapshot = repo
+        .get_assistant_snapshot("user_1", &auto_conv.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(auto_snapshot.resolved_permission_value.as_deref(), Some("plan"));
 
     upsert_test_assistant_definition(
@@ -4112,15 +4773,18 @@ async fn set_mode_updates_assistant_preference_only_when_snapshot_permission_mod
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_mode_fixed",
-            last_model_id: None,
-            last_permission_value: Some("legacy-fixed-mode"),
-            last_thought_level_value: None,
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_mode_fixed",
+                last_model_id: None,
+                last_permission_value: Some("legacy-fixed-mode"),
+                last_thought_level_value: None,
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -4133,6 +4797,7 @@ async fn set_mode_updates_assistant_preference_only_when_snapshot_permission_mod
 
     let _ = svc
         .set_mode(
+            "user_1",
             &fixed_conv.id,
             SetModeRequest {
                 mode: "acceptEdits".to_owned(),
@@ -4141,9 +4806,17 @@ async fn set_mode_updates_assistant_preference_only_when_snapshot_permission_mod
         .await
         .unwrap();
 
-    let fixed_pref = preference_repo.get("asstdef_mode_fixed").await.unwrap().unwrap();
+    let fixed_pref = preference_repo
+        .get_for_user("user_1", "asstdef_mode_fixed")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(fixed_pref.last_permission_value.as_deref(), Some("legacy-fixed-mode"));
-    let fixed_snapshot = repo.get_assistant_snapshot(&fixed_conv.id).await.unwrap().unwrap();
+    let fixed_snapshot = repo
+        .get_assistant_snapshot("user_1", &fixed_conv.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(fixed_snapshot.resolved_permission_value.as_deref(), Some("acceptEdits"));
 }
 
@@ -4173,15 +4846,18 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_acp_auto",
-            last_model_id: Some("legacy-acp-model"),
-            last_permission_value: Some("legacy-mode"),
-            last_thought_level_value: Some("legacy-low"),
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_acp_auto",
+                last_model_id: Some("legacy-acp-model"),
+                last_permission_value: Some("legacy-mode"),
+                last_thought_level_value: Some("legacy-low"),
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -4192,6 +4868,7 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
 
     let result = svc
         .set_config_option(
+            "user_1",
             &conv.id,
             "model",
             SetConfigOptionRequest {
@@ -4202,13 +4879,18 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
         .unwrap();
     assert_eq!(result.confirmation, ConfigOptionConfirmation::Observed);
 
-    let pref_after_model = preference_repo.get("asstdef_acp_auto").await.unwrap().unwrap();
+    let pref_after_model = preference_repo
+        .get_for_user("user_1", "asstdef_acp_auto")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(pref_after_model.last_model_id.as_deref(), Some("gpt-5.5"));
     assert_eq!(pref_after_model.last_permission_value.as_deref(), Some("legacy-mode"));
-    let snapshot_after_model = repo.get_assistant_snapshot(&conv.id).await.unwrap().unwrap();
+    let snapshot_after_model = repo.get_assistant_snapshot("user_1", &conv.id).await.unwrap().unwrap();
     assert_eq!(snapshot_after_model.resolved_model_id.as_deref(), Some("gpt-5.5"));
 
     svc.set_config_option(
+        "user_1",
         &conv.id,
         "mode",
         SetConfigOptionRequest {
@@ -4217,15 +4899,20 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
     )
     .await
     .unwrap();
-    let pref_after_mode = preference_repo.get("asstdef_acp_auto").await.unwrap().unwrap();
+    let pref_after_mode = preference_repo
+        .get_for_user("user_1", "asstdef_acp_auto")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(pref_after_mode.last_model_id.as_deref(), Some("gpt-5.5"));
     assert_eq!(pref_after_mode.last_permission_value.as_deref(), Some("plan"));
-    let snapshot_after_mode = repo.get_assistant_snapshot(&conv.id).await.unwrap().unwrap();
+    let snapshot_after_mode = repo.get_assistant_snapshot("user_1", &conv.id).await.unwrap().unwrap();
     assert_eq!(snapshot_after_mode.resolved_permission_value.as_deref(), Some("plan"));
 
     // Thought-level config options follow the same auto-default writeback
     // contract as model and permission defaults.
     svc.set_config_option(
+        "user_1",
         &conv.id,
         "reasoning_effort",
         SetConfigOptionRequest {
@@ -4234,11 +4921,15 @@ async fn set_config_option_persists_runtime_model_into_assistant_preference_when
     )
     .await
     .unwrap();
-    let pref_after_thought = preference_repo.get("asstdef_acp_auto").await.unwrap().unwrap();
+    let pref_after_thought = preference_repo
+        .get_for_user("user_1", "asstdef_acp_auto")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(pref_after_thought.last_model_id.as_deref(), Some("gpt-5.5"));
     assert_eq!(pref_after_thought.last_permission_value.as_deref(), Some("plan"));
     assert_eq!(pref_after_thought.last_thought_level_value.as_deref(), Some("high"));
-    let snapshot_after_thought = repo.get_assistant_snapshot(&conv.id).await.unwrap().unwrap();
+    let snapshot_after_thought = repo.get_assistant_snapshot("user_1", &conv.id).await.unwrap().unwrap();
     assert_eq!(
         snapshot_after_thought.resolved_thought_level_value.as_deref(),
         Some("high")
@@ -4271,15 +4962,18 @@ async fn set_config_option_does_not_persist_preference_on_error() {
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_acp_auto",
-            last_model_id: Some("original-model"),
-            last_permission_value: Some("original-mode"),
-            last_thought_level_value: Some("original-low"),
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_acp_auto",
+                last_model_id: Some("original-model"),
+                last_permission_value: Some("original-mode"),
+                last_thought_level_value: Some("original-low"),
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -4297,6 +4991,7 @@ async fn set_config_option_does_not_persist_preference_on_error() {
 
     let result = svc
         .set_config_option(
+            "user_1",
             &conv.id,
             "model",
             SetConfigOptionRequest {
@@ -4306,7 +5001,11 @@ async fn set_config_option_does_not_persist_preference_on_error() {
         .await;
     assert!(result.is_err(), "conflict from agent must surface as error");
 
-    let pref_after = preference_repo.get("asstdef_acp_auto").await.unwrap().unwrap();
+    let pref_after = preference_repo
+        .get_for_user("user_1", "asstdef_acp_auto")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         pref_after.last_model_id.as_deref(),
         Some("original-model"),
@@ -4341,15 +5040,18 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_acp_fixed",
-            last_model_id: Some("legacy-fixed-model"),
-            last_permission_value: Some("legacy-fixed-mode"),
-            last_thought_level_value: None,
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_acp_fixed",
+                last_model_id: Some("legacy-fixed-model"),
+                last_permission_value: Some("legacy-fixed-mode"),
+                last_thought_level_value: None,
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -4358,6 +5060,7 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
     task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
 
     svc.set_config_option(
+        "user_1",
         &conv.id,
         "model",
         SetConfigOptionRequest {
@@ -4367,6 +5070,7 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
     .await
     .unwrap();
     svc.set_config_option(
+        "user_1",
         &conv.id,
         "mode",
         SetConfigOptionRequest {
@@ -4376,6 +5080,7 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
     .await
     .unwrap();
     svc.set_config_option(
+        "user_1",
         &conv.id,
         "reasoning_effort",
         SetConfigOptionRequest {
@@ -4385,13 +5090,17 @@ async fn set_config_option_skips_preference_write_back_when_default_mode_is_fixe
     .await
     .unwrap();
 
-    let pref = preference_repo.get("asstdef_acp_fixed").await.unwrap().unwrap();
+    let pref = preference_repo
+        .get_for_user("user_1", "asstdef_acp_fixed")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(pref.last_model_id.as_deref(), Some("legacy-fixed-model"));
     assert_eq!(pref.last_permission_value.as_deref(), Some("legacy-fixed-mode"));
     assert_eq!(pref.last_thought_level_value.as_deref(), None);
     // The snapshot still tracks the runtime override so the active session reflects it,
     // even though the persisted assistant preference must not change for fixed defaults.
-    let snapshot = repo.get_assistant_snapshot(&conv.id).await.unwrap().unwrap();
+    let snapshot = repo.get_assistant_snapshot("user_1", &conv.id).await.unwrap().unwrap();
     assert_eq!(snapshot.resolved_model_id.as_deref(), Some("transient-model"));
     assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("transient-mode"));
     assert_eq!(snapshot.resolved_thought_level_value.as_deref(), Some("transient-high"));
@@ -4423,15 +5132,18 @@ async fn set_config_option_command_ack_does_not_persist_assistant_preference() {
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_acp_ack",
-            last_model_id: Some("legacy-ack-model"),
-            last_permission_value: Some("legacy-ack-mode"),
-            last_thought_level_value: Some("legacy-ack-thought"),
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_acp_ack",
+                last_model_id: Some("legacy-ack-model"),
+                last_permission_value: Some("legacy-ack-mode"),
+                last_thought_level_value: Some("legacy-ack-thought"),
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -4445,6 +5157,7 @@ async fn set_config_option_command_ack_does_not_persist_assistant_preference() {
     task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
 
     svc.set_config_option(
+        "user_1",
         &conv.id,
         // POUNDING routes "model"/"mode" to dedicated CC-Switch endpoints that
         // always return Observed, so they can never surface a CommandAck. Use a
@@ -4458,14 +5171,18 @@ async fn set_config_option_command_ack_does_not_persist_assistant_preference() {
     .await
     .unwrap();
 
-    let pref = preference_repo.get("asstdef_acp_ack").await.unwrap().unwrap();
+    let pref = preference_repo
+        .get_for_user("user_1", "asstdef_acp_ack")
+        .await
+        .unwrap()
+        .unwrap();
     // CommandAck means the agent merely accepted the request, not that the value
     // is in effect — the thought-level preference (the field this option maps to)
     // must stay at the legacy value, and unrelated fields are untouched too.
     assert_eq!(pref.last_thought_level_value.as_deref(), Some("legacy-ack-thought"));
     assert_eq!(pref.last_model_id.as_deref(), Some("legacy-ack-model"));
     assert_eq!(pref.last_permission_value.as_deref(), Some("legacy-ack-mode"));
-    let snapshot = repo.get_assistant_snapshot(&conv.id).await.unwrap().unwrap();
+    let snapshot = repo.get_assistant_snapshot("user_1", &conv.id).await.unwrap().unwrap();
     assert_eq!(
         snapshot.resolved_thought_level_value.as_deref(),
         Some("legacy-ack-thought")
@@ -4498,15 +5215,18 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_aionrs_auto",
-            last_model_id: Some("legacy-aionrs-model"),
-            last_permission_value: None,
-            last_thought_level_value: None,
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_aionrs_auto",
+                last_model_id: Some("legacy-aionrs-model"),
+                last_permission_value: None,
+                last_thought_level_value: None,
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -4523,6 +5243,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
                     use_model: Some("model-z".to_owned()),
                 }),
                 name: None,
+                name_source: None,
                 extra: None,
                 pinned: None,
             },
@@ -4535,9 +5256,17 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
         updated.model.as_ref().and_then(|model| model.use_model.as_deref()),
         Some("model-z")
     );
-    let auto_pref = preference_repo.get("asstdef_aionrs_auto").await.unwrap().unwrap();
+    let auto_pref = preference_repo
+        .get_for_user("user_1", "asstdef_aionrs_auto")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(auto_pref.last_model_id.as_deref(), Some("model-z"));
-    let auto_snapshot = repo.get_assistant_snapshot(&auto_conv.id).await.unwrap().unwrap();
+    let auto_snapshot = repo
+        .get_assistant_snapshot("user_1", &auto_conv.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(auto_snapshot.resolved_model_id.as_deref(), Some("model-z"));
 
     upsert_test_assistant_definition(
@@ -4560,15 +5289,18 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_aionrs_fixed",
-            last_model_id: Some("legacy-aionrs-fixed-model"),
-            last_permission_value: None,
-            last_thought_level_value: None,
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_aionrs_fixed",
+                last_model_id: Some("legacy-aionrs-fixed-model"),
+                last_permission_value: None,
+                last_thought_level_value: None,
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -4585,6 +5317,7 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
                     use_model: Some("model-y".to_owned()),
                 }),
                 name: None,
+                name_source: None,
                 extra: None,
                 pinned: None,
             },
@@ -4593,13 +5326,21 @@ async fn update_aionrs_model_updates_assistant_preference_only_when_snapshot_mod
         .await
         .unwrap();
 
-    let fixed_pref = preference_repo.get("asstdef_aionrs_fixed").await.unwrap().unwrap();
+    let fixed_pref = preference_repo
+        .get_for_user("user_1", "asstdef_aionrs_fixed")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(fixed_pref.last_model_id.as_deref(), Some("legacy-aionrs-fixed-model"));
-    let fixed_snapshot = repo.get_assistant_snapshot(&fixed_conv.id).await.unwrap().unwrap();
+    let fixed_snapshot = repo
+        .get_assistant_snapshot("user_1", &fixed_conv.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(fixed_snapshot.resolved_model_id.as_deref(), Some("model-y"));
 
     // Ensure the update path used the repository row, not a no-op.
-    let updated_row = repo.get(&fixed_conv.id).await.unwrap().unwrap();
+    let updated_row = repo.get("user_1", &fixed_conv.id).await.unwrap().unwrap();
     assert!(
         updated_row
             .model
@@ -4617,6 +5358,7 @@ async fn send_message_missing_workspace_persists_message_and_failure_tip() {
     broadcaster.take_events();
     let legacy_workspace = format!("/tmp/does-not-exist-{}", aionui_common::generate_short_id());
     repo.update(
+        "user_1",
         &conv.id,
         &ConversationRowUpdate {
             extra: Some(json!({ "workspace": legacy_workspace }).to_string()),
@@ -4639,6 +5381,7 @@ async fn send_message_missing_workspace_persists_message_and_failure_tip() {
         loop {
             let messages = repo
                 .list_messages_page(
+                    "user_1",
                     &conv.id,
                     &MessagePageParams {
                         limit: 20,
@@ -4744,7 +5487,7 @@ async fn send_message_returns_before_cold_agent_build_completes() {
         "cold agent build should continue in the background after send_message returns"
     );
 
-    let updated = repo.get(&conv.id).await.unwrap().unwrap();
+    let updated = repo.get("user_1", &conv.id).await.unwrap().unwrap();
     assert_ne!(updated.status.as_deref(), Some("running"));
     assert!(
         svc.runtime_state().is_claimed(&conv.id),
@@ -4768,6 +5511,7 @@ async fn send_message_persists_hidden_user_message_when_requested() {
 
     let messages = repo
         .list_messages_page(
+            "user_1",
             &conv.id,
             &MessagePageParams {
                 limit: 20,
@@ -4808,6 +5552,7 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
         loop {
             let messages = repo
                 .list_messages_page(
+                    "user_1",
                     &conv.id,
                     &MessagePageParams {
                         limit: 20,
@@ -4848,7 +5593,7 @@ async fn send_message_persists_error_tip_when_agent_build_fails() {
         "The upstream Agent failed while handling the request"
     );
 
-    let updated = repo.get(&conv.id).await.unwrap().unwrap();
+    let updated = repo.get("user_1", &conv.id).await.unwrap().unwrap();
     assert_eq!(updated.status.as_deref(), Some("finished"));
     assert!(
         !svc.runtime_state().is_claimed(&conv.id),
@@ -4908,32 +5653,36 @@ async fn run_agent_turn_returns_error_message_when_agent_build_fails() {
 async fn latest_conversation_error_message_prefers_error_detail() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
-    repo.insert_message(&MessageRow {
-        id: "msg_error".into(),
-        conversation_id: conv.id.clone(),
-        msg_id: None,
-        r#type: "tips".into(),
-        content: serde_json::json!({
-            "content": "Current agent failed",
-            "type": "error",
-            "details": {
-                "detail": "Cannot resume Claude session with Codex assistant"
-            },
-            "error": {
-                "message": "Current agent failed",
-                "detail": "Codex cannot resume a conversation created by Claude"
-            }
-        })
-        .to_string(),
-        position: Some("center".into()),
-        status: Some("error".into()),
-        hidden: false,
-        created_at: 10,
-    })
+    repo.insert_message(
+        "user_1",
+        &MessageRow {
+            id: "msg_error".into(),
+            conversation_id: conv.id.clone(),
+            msg_id: None,
+            r#type: "tips".into(),
+            content: serde_json::json!({
+                "content": "Current agent failed",
+                "type": "error",
+                "details": {
+                    "detail": "Cannot resume Claude session with Codex assistant"
+                },
+                "error": {
+                    "message": "Current agent failed",
+                    "detail": "Codex cannot resume a conversation created by Claude"
+                }
+            })
+            .to_string(),
+            position: Some("center".into()),
+            status: Some("error".into()),
+            hidden: false,
+            created_at: 10,
+            backend_turn_id: None,
+        },
+    )
     .await
     .unwrap();
 
-    let message = svc.latest_conversation_error_message(&conv.id).await.unwrap();
+    let message = svc.latest_conversation_error_message("user_1", &conv.id).await.unwrap();
 
     assert_eq!(
         message.as_deref(),
@@ -4977,6 +5726,7 @@ async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_
 
     let messages = repo
         .list_messages_page(
+            "user_1",
             &conv.id,
             &MessagePageParams {
                 limit: 20,
@@ -5086,7 +5836,7 @@ async fn send_message_allows_stale_db_running_without_runtime_claim() {
         status: Some("running".into()),
         ..Default::default()
     };
-    repo.update(&conv.id, &update).await.unwrap();
+    repo.update("user_1", &conv.id, &update).await.unwrap();
 
     let result = svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr).await;
     assert!(result.is_ok(), "stale DB running must not block sending");
@@ -5126,6 +5876,7 @@ async fn send_message_rejects_when_runtime_is_shutting_down() {
 
     let messages = repo
         .list_messages_page(
+            "user_1",
             &conv.id,
             &MessagePageParams {
                 limit: 20,
@@ -5163,6 +5914,7 @@ async fn send_message_build_failure_while_deleting_skips_failure_tip_and_complet
 
     let messages = repo
         .list_messages_page(
+            "user_1",
             &conv.id,
             &MessagePageParams {
                 limit: 20,
@@ -5207,7 +5959,7 @@ async fn send_message_persists_factory_resolved_workspace() {
         extra: Some(r#"{"workspace":""}"#.to_owned()),
         ..Default::default()
     };
-    repo.update(&conv.id, &empty_ws_update).await.unwrap();
+    repo.update("user_1", &conv.id, &empty_ws_update).await.unwrap();
 
     svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr)
         .await
@@ -5233,30 +5985,38 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
     let (svc, _broadcaster, repo, _task_mgr) = make_service();
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
 
-    repo.insert_message(&MessageRow {
-        id: "visible-stale".into(),
-        conversation_id: conv.id.clone(),
-        msg_id: Some("visible-stale".into()),
-        r#type: "text".into(),
-        content: json!({ "content": "partial output" }).to_string(),
-        position: Some("left".into()),
-        status: Some("work".into()),
-        hidden: false,
-        created_at: 1,
-    })
+    repo.insert_message(
+        "user_1",
+        &MessageRow {
+            id: "visible-stale".into(),
+            conversation_id: conv.id.clone(),
+            msg_id: Some("visible-stale".into()),
+            r#type: "text".into(),
+            content: json!({ "content": "partial output" }).to_string(),
+            position: Some("left".into()),
+            status: Some("work".into()),
+            hidden: false,
+            created_at: 1,
+            backend_turn_id: None,
+        },
+    )
     .await
     .unwrap();
-    repo.insert_message(&MessageRow {
-        id: "empty-stale".into(),
-        conversation_id: conv.id.clone(),
-        msg_id: Some("empty-stale".into()),
-        r#type: "thinking".into(),
-        content: json!({ "content": "" }).to_string(),
-        position: Some("left".into()),
-        status: Some("pending".into()),
-        hidden: false,
-        created_at: 2,
-    })
+    repo.insert_message(
+        "user_1",
+        &MessageRow {
+            id: "empty-stale".into(),
+            conversation_id: conv.id.clone(),
+            msg_id: Some("empty-stale".into()),
+            r#type: "thinking".into(),
+            content: json!({ "content": "" }).to_string(),
+            position: Some("left".into()),
+            status: Some("pending".into()),
+            hidden: false,
+            created_at: 2,
+            backend_turn_id: None,
+        },
+    )
     .await
     .unwrap();
 
@@ -5264,6 +6024,7 @@ async fn startup_recovery_closes_stale_runtime_messages_without_failure_tip() {
 
     let messages = repo
         .list_messages_page(
+            "user_1",
             &conv.id,
             &MessagePageParams {
                 limit: 20,
@@ -5365,6 +6126,7 @@ async fn send_message_does_not_inject_send_error_when_runtime_terminal_exists() 
 
     let messages = repo
         .list_messages_page(
+            "user_1",
             &conv.id,
             &MessagePageParams {
                 limit: 20,
@@ -5403,6 +6165,7 @@ async fn send_message_injects_send_error_when_runtime_terminal_missing() {
 
     let messages = repo
         .list_messages_page(
+            "user_1",
             &conv.id,
             &MessagePageParams {
                 limit: 20,
@@ -5458,11 +6221,13 @@ async fn send_message_records_agent_availability_feedback_on_send_failure() {
         failures,
         vec![
             RecordedAvailabilityFailure {
+                user_id: "user_1".into(),
                 agent_id: "agent-feedback-1".into(),
                 code: "session_send_failed".into(),
                 message: "provider returned 401 invalid api key".into(),
             },
             RecordedAvailabilityFailure {
+                user_id: "user_1".into(),
                 agent_id: "agent-feedback-1".into(),
                 code: "auth_required".into(),
                 message: "provider returned 401 invalid api key".into(),
@@ -5503,7 +6268,10 @@ async fn send_message_records_agent_availability_feedback_on_send_success() {
     wait_for_turn_released(&svc, &conv.id).await;
 
     let successes = feedback.successes.lock().unwrap().clone();
-    assert_eq!(successes, vec!["agent-feedback-success".to_owned()]);
+    assert_eq!(
+        successes,
+        vec![("user_1".to_owned(), "agent-feedback-success".to_owned())]
+    );
     assert!(feedback.failures.lock().unwrap().is_empty());
 }
 
@@ -5640,7 +6408,9 @@ async fn auto_replay_rebuild_keeps_existing_acp_session_id_in_build_options() {
             AgentSessionKind::Acp(ctx) => {
                 assert_eq!(ctx.session_id.as_deref(), Some("sess-existing"));
             }
-            AgentSessionKind::Aionrs(_) => panic!("test conversation should build ACP options"),
+            AgentSessionKind::Aionrs(_) | AgentSessionKind::Antigravity(_) => {
+                panic!("test conversation should build ACP options")
+            }
         }
     }
 }
@@ -6172,6 +6942,7 @@ async fn warmup_rejects_legacy_workspace_with_runtime_error_code() {
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
     let legacy_workspace = format!("/tmp/does-not-exist-{}", aionui_common::generate_short_id());
     repo.update(
+        "user_1",
         &conv.id,
         &ConversationRowUpdate {
             extra: Some(json!({ "workspace": legacy_workspace }).to_string()),
@@ -6625,25 +7396,31 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
         .await
         .unwrap();
     state_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            assistant_definition_id: "asstdef_preset_1",
-            enabled: true,
-            sort_order: 0,
-            agent_id_override: Some("claude"),
-            last_used_at: None,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: "asstdef_preset_1",
+                enabled: true,
+                sort_order: 0,
+                agent_id_override: Some("claude"),
+                last_used_at: None,
+            },
+        )
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_preset_1",
-            last_model_id: Some("old-model"),
-            last_permission_value: Some("workspace-write"),
-            last_thought_level_value: Some("high"),
-            last_skill_ids: r#"["legacy-skill"]"#,
-            last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
-            last_mcp_ids: r#"["legacy-mcp"]"#,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_preset_1",
+                last_model_id: Some("old-model"),
+                last_permission_value: Some("workspace-write"),
+                last_thought_level_value: Some("high"),
+                last_skill_ids: r#"["legacy-skill"]"#,
+                last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
+                last_mcp_ids: r#"["legacy-mcp"]"#,
+            },
+        )
         .await
         .unwrap();
 
@@ -6689,7 +7466,7 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
     assert_eq!(resp.extra["skills"], json!(["cron", "pdf"]));
     assert!(resp.extra.get("assistant_snapshot").is_none());
 
-    let snapshot = repo.get_assistant_snapshot(&resp.id).await.unwrap().unwrap();
+    let snapshot = repo.get_assistant_snapshot("user_1", &resp.id).await.unwrap().unwrap();
     assert_eq!(snapshot.assistant_definition_id, "asstdef_preset_1");
     assert_eq!(snapshot.assistant_id, "preset-1");
     assert_eq!(snapshot.agent_id, "2d23ff1c");
@@ -6699,7 +7476,11 @@ async fn create_resolves_assistant_snapshot_and_updates_preferences() {
     assert_eq!(snapshot.default_skills_mode, "auto");
     assert_eq!(snapshot.resolved_skill_ids, r#"["pdf"]"#);
 
-    let updated_pref = preference_repo.get("asstdef_preset_1").await.unwrap().unwrap();
+    let updated_pref = preference_repo
+        .get_for_user("user-1", "asstdef_preset_1")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(updated_pref.last_model_id.as_deref(), Some("new-model"));
     assert_eq!(updated_pref.last_skill_ids, r#"["pdf"]"#);
     assert_eq!(updated_pref.last_disabled_builtin_skill_ids, r#"["todo-tracker"]"#);
@@ -6752,46 +7533,52 @@ async fn existing_conversation_reads_current_assistant_identity() {
     let workspace = ensure_test_workspace_path();
 
     definition_repo
-        .upsert(&UpsertAssistantDefinitionParams {
-            id: "asstdef_live_identity",
-            assistant_id: "live-identity",
-            source: "user",
-            owner_type: "user",
-            source_ref: Some("live-identity"),
-            name: "Old Name",
-            name_i18n: "{}",
-            description: None,
-            description_i18n: "{}",
-            avatar_type: "emoji",
-            avatar_value: Some("🤖"),
-            agent_id: "claude",
-            rule_resource_type: "none",
-            rule_resource_ref: None,
-            recommended_prompts: "[]",
-            recommended_prompts_i18n: "{}",
-            default_model_mode: "auto",
-            default_model_value: None,
-            default_permission_mode: "auto",
-            default_permission_value: None,
-            default_thought_level_mode: "auto",
-            default_thought_level_value: None,
-            default_skills_mode: "auto",
-            default_skill_ids: "[]",
-            custom_skill_names: "[]",
-            default_disabled_builtin_skill_ids: "[]",
-            default_mcps_mode: "auto",
-            default_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantDefinitionParams {
+                id: "asstdef_live_identity",
+                assistant_id: "live-identity",
+                source: "user",
+                owner_type: "user",
+                source_ref: Some("live-identity"),
+                name: "Old Name",
+                name_i18n: "{}",
+                description: None,
+                description_i18n: "{}",
+                avatar_type: "emoji",
+                avatar_value: Some("🤖"),
+                agent_id: "claude",
+                rule_resource_type: "none",
+                rule_resource_ref: None,
+                recommended_prompts: "[]",
+                recommended_prompts_i18n: "{}",
+                default_model_mode: "auto",
+                default_model_value: None,
+                default_permission_mode: "auto",
+                default_permission_value: None,
+                default_thought_level_mode: "auto",
+                default_thought_level_value: None,
+                default_skills_mode: "auto",
+                default_skill_ids: "[]",
+                custom_skill_names: "[]",
+                default_disabled_builtin_skill_ids: "[]",
+                default_mcps_mode: "auto",
+                default_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
     state_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            assistant_definition_id: "asstdef_live_identity",
-            enabled: true,
-            sort_order: 0,
-            agent_id_override: None,
-            last_used_at: None,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: "asstdef_live_identity",
+                enabled: true,
+                sort_order: 0,
+                agent_id_override: None,
+                last_used_at: None,
+            },
+        )
         .await
         .unwrap();
 
@@ -6808,36 +7595,39 @@ async fn existing_conversation_reads_current_assistant_identity() {
     let created = svc.create("user-1", req).await.unwrap();
 
     definition_repo
-        .upsert(&UpsertAssistantDefinitionParams {
-            id: "asstdef_live_identity",
-            assistant_id: "live-identity",
-            source: "user",
-            owner_type: "user",
-            source_ref: Some("live-identity"),
-            name: "New Name",
-            name_i18n: "{}",
-            description: None,
-            description_i18n: "{}",
-            avatar_type: "emoji",
-            avatar_value: Some("🧪"),
-            agent_id: "claude",
-            rule_resource_type: "none",
-            rule_resource_ref: None,
-            recommended_prompts: "[]",
-            recommended_prompts_i18n: "{}",
-            default_model_mode: "auto",
-            default_model_value: None,
-            default_permission_mode: "auto",
-            default_permission_value: None,
-            default_thought_level_mode: "auto",
-            default_thought_level_value: None,
-            default_skills_mode: "auto",
-            default_skill_ids: "[]",
-            custom_skill_names: "[]",
-            default_disabled_builtin_skill_ids: "[]",
-            default_mcps_mode: "auto",
-            default_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantDefinitionParams {
+                id: "asstdef_live_identity",
+                assistant_id: "live-identity",
+                source: "user",
+                owner_type: "user",
+                source_ref: Some("live-identity"),
+                name: "New Name",
+                name_i18n: "{}",
+                description: None,
+                description_i18n: "{}",
+                avatar_type: "emoji",
+                avatar_value: Some("🧪"),
+                agent_id: "claude",
+                rule_resource_type: "none",
+                rule_resource_ref: None,
+                recommended_prompts: "[]",
+                recommended_prompts_i18n: "{}",
+                default_model_mode: "auto",
+                default_model_value: None,
+                default_permission_mode: "auto",
+                default_permission_value: None,
+                default_thought_level_mode: "auto",
+                default_thought_level_value: None,
+                default_skills_mode: "auto",
+                default_skill_ids: "[]",
+                custom_skill_names: "[]",
+                default_disabled_builtin_skill_ids: "[]",
+                default_mcps_mode: "auto",
+                default_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -6879,46 +7669,52 @@ async fn create_routes_asset_avatar_in_assistant_identity_through_backend() {
     let workspace = ensure_test_workspace_path();
 
     definition_repo
-        .upsert(&UpsertAssistantDefinitionParams {
-            id: "asstdef_data_avatar",
-            assistant_id: "custom-data-avatar",
-            source: "user",
-            owner_type: "user",
-            source_ref: Some("custom-data-avatar"),
-            name: "Data Avatar",
-            name_i18n: "{}",
-            description: None,
-            description_i18n: "{}",
-            avatar_type: "user_asset",
-            avatar_value: Some("data:image/svg+xml;base64,PHN2Zy8+"),
-            agent_id: "claude",
-            rule_resource_type: "none",
-            rule_resource_ref: None,
-            recommended_prompts: "[]",
-            recommended_prompts_i18n: "{}",
-            default_model_mode: "auto",
-            default_model_value: None,
-            default_permission_mode: "auto",
-            default_permission_value: None,
-            default_thought_level_mode: "auto",
-            default_thought_level_value: None,
-            default_skills_mode: "auto",
-            default_skill_ids: "[]",
-            custom_skill_names: "[]",
-            default_disabled_builtin_skill_ids: "[]",
-            default_mcps_mode: "auto",
-            default_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantDefinitionParams {
+                id: "asstdef_data_avatar",
+                assistant_id: "custom-data-avatar",
+                source: "user",
+                owner_type: "user",
+                source_ref: Some("custom-data-avatar"),
+                name: "Data Avatar",
+                name_i18n: "{}",
+                description: None,
+                description_i18n: "{}",
+                avatar_type: "user_asset",
+                avatar_value: Some("data:image/svg+xml;base64,PHN2Zy8+"),
+                agent_id: "claude",
+                rule_resource_type: "none",
+                rule_resource_ref: None,
+                recommended_prompts: "[]",
+                recommended_prompts_i18n: "{}",
+                default_model_mode: "auto",
+                default_model_value: None,
+                default_permission_mode: "auto",
+                default_permission_value: None,
+                default_thought_level_mode: "auto",
+                default_thought_level_value: None,
+                default_skills_mode: "auto",
+                default_skill_ids: "[]",
+                custom_skill_names: "[]",
+                default_disabled_builtin_skill_ids: "[]",
+                default_mcps_mode: "auto",
+                default_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
     state_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            assistant_definition_id: "asstdef_data_avatar",
-            enabled: true,
-            sort_order: 0,
-            agent_id_override: None,
-            last_used_at: None,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: "asstdef_data_avatar",
+                enabled: true,
+                sort_order: 0,
+                agent_id_override: None,
+                last_used_at: None,
+            },
+        )
         .await
         .unwrap();
 
@@ -6971,14 +7767,16 @@ async fn assistant_backed_acp_build_options_include_snapshot_rule_as_preset_cont
         .unwrap();
 
     let conv = create_assistant_backed_conversation(&svc, "user_1", Some("acp"), "claude", "preset-acp-rule").await;
-    let row = repo.get(&conv.id).await.unwrap().unwrap();
+    let row = repo.get("user_1", &conv.id).await.unwrap().unwrap();
     let options = svc.build_task_options(&row).await.unwrap();
 
     match options.context.kind {
         AgentSessionKind::Acp(ctx) => {
             assert_eq!(ctx.config.preset_context.as_deref(), Some("assistant rule body"));
         }
-        AgentSessionKind::Aionrs(_) => panic!("test conversation should build ACP options"),
+        AgentSessionKind::Aionrs(_) | AgentSessionKind::Antigravity(_) => {
+            panic!("test conversation should build ACP options")
+        }
     }
 }
 
@@ -7013,11 +7811,13 @@ async fn assistant_backed_aionrs_build_options_include_snapshot_rule_as_preset_r
 
     let conv =
         create_assistant_backed_conversation(&svc, "user_1", Some("aionrs"), "aionrs", "preset-aionrs-rule").await;
-    let row = repo.get(&conv.id).await.unwrap().unwrap();
+    let row = repo.get("user_1", &conv.id).await.unwrap().unwrap();
     let options = svc.build_task_options(&row).await.unwrap();
 
     match options.context.kind {
-        AgentSessionKind::Acp(_) => panic!("test conversation should build Aionrs options"),
+        AgentSessionKind::Acp(_) | AgentSessionKind::Antigravity(_) => {
+            panic!("test conversation should build Aionrs options")
+        }
         AgentSessionKind::Aionrs(ctx) => {
             assert_eq!(ctx.config.preset_rules.as_deref(), Some("assistant rule body"));
         }
@@ -7070,25 +7870,31 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
         .await
         .unwrap();
     state_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            assistant_definition_id: "asstdef_preset_legacy_seed",
-            enabled: true,
-            sort_order: 0,
-            agent_id_override: Some("claude"),
-            last_used_at: None,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: "asstdef_preset_legacy_seed",
+                enabled: true,
+                sort_order: 0,
+                agent_id_override: Some("claude"),
+                last_used_at: None,
+            },
+        )
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_preset_legacy_seed",
-            last_model_id: Some("preferred-model"),
-            last_permission_value: Some("workspace-write"),
-            last_thought_level_value: Some("medium"),
-            last_skill_ids: r#"["legacy-skill"]"#,
-            last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
-            last_mcp_ids: r#"["legacy-mcp"]"#,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_preset_legacy_seed",
+                last_model_id: Some("preferred-model"),
+                last_permission_value: Some("workspace-write"),
+                last_thought_level_value: Some("medium"),
+                last_skill_ids: r#"["legacy-skill"]"#,
+                last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
+                last_mcp_ids: r#"["legacy-mcp"]"#,
+            },
+        )
         .await
         .unwrap();
 
@@ -7117,7 +7923,7 @@ async fn create_prefers_assistant_snapshot_over_legacy_runtime_seed_fields() {
     assert_eq!(resp.extra["session_mode"], json!("workspace-write"));
     assert_eq!(resp.extra["current_mode_id"], json!("workspace-write"));
 
-    let snapshot = repo.get_assistant_snapshot(&resp.id).await.unwrap().unwrap();
+    let snapshot = repo.get_assistant_snapshot("user_1", &resp.id).await.unwrap().unwrap();
     assert_eq!(snapshot.agent_id, "2d23ff1c");
     assert_eq!(snapshot.resolved_model_id.as_deref(), Some("override-model"));
     assert_eq!(snapshot.resolved_permission_value.as_deref(), Some("workspace-write"));
@@ -7143,13 +7949,16 @@ async fn create_prefers_snapshot_runtime_identity_over_legacy_extra_identity() {
     )
     .await;
     overlay_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            assistant_definition_id: "asstdef_snapshot_identity",
-            enabled: true,
-            sort_order: 0,
-            agent_id_override: None,
-            last_used_at: None,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: "asstdef_snapshot_identity",
+                enabled: true,
+                sort_order: 0,
+                agent_id_override: None,
+                last_used_at: None,
+            },
+        )
         .await
         .unwrap();
 
@@ -7180,9 +7989,9 @@ async fn create_prefers_snapshot_runtime_identity_over_legacy_extra_identity() {
 
     let create_calls = acp_repo.create_calls();
     assert_eq!(create_calls.len(), 1);
+    assert_eq!(create_calls[0].user_id, "user-1");
     assert_eq!(create_calls[0].agent_id, "2d23ff1c");
     assert_eq!(create_calls[0].agent_source, "builtin");
-    assert_eq!(create_calls[0].agent_id, "2d23ff1c");
 }
 
 #[tokio::test]
@@ -7231,25 +8040,31 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
         .await
         .unwrap();
     state_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            assistant_definition_id: "asstdef_preset_fixed",
-            enabled: true,
-            sort_order: 0,
-            agent_id_override: Some("claude"),
-            last_used_at: None,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: "asstdef_preset_fixed",
+                enabled: true,
+                sort_order: 0,
+                agent_id_override: Some("claude"),
+                last_used_at: None,
+            },
+        )
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_preset_fixed",
-            last_model_id: Some("legacy-model"),
-            last_permission_value: Some("workspace-write"),
-            last_thought_level_value: Some("legacy-thought"),
-            last_skill_ids: r#"["legacy-skill"]"#,
-            last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
-            last_mcp_ids: r#"["legacy-mcp"]"#,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_preset_fixed",
+                last_model_id: Some("legacy-model"),
+                last_permission_value: Some("workspace-write"),
+                last_thought_level_value: Some("legacy-thought"),
+                last_skill_ids: r#"["legacy-skill"]"#,
+                last_disabled_builtin_skill_ids: r#"["legacy-disabled"]"#,
+                last_mcp_ids: r#"["legacy-mcp"]"#,
+            },
+        )
         .await
         .unwrap();
 
@@ -7275,7 +8090,11 @@ async fn create_does_not_overwrite_preferences_for_fixed_skills_and_mcps() {
     .unwrap();
     let _resp = svc.create("user-1", req).await.unwrap();
 
-    let updated_pref = preference_repo.get("asstdef_preset_fixed").await.unwrap().unwrap();
+    let updated_pref = preference_repo
+        .get_for_user("user-1", "asstdef_preset_fixed")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(updated_pref.last_model_id.as_deref(), Some("new-model"));
     assert_eq!(updated_pref.last_permission_value.as_deref(), Some("workspace-read"));
     assert_eq!(updated_pref.last_skill_ids, r#"["legacy-skill"]"#);
@@ -7329,25 +8148,31 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
         .await
         .unwrap();
     state_repo
-        .upsert(&UpsertAssistantOverlayParams {
-            assistant_definition_id: "asstdef_preset_auto",
-            enabled: true,
-            sort_order: 0,
-            agent_id_override: Some("claude"),
-            last_used_at: None,
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantOverlayParams {
+                assistant_definition_id: "asstdef_preset_auto",
+                enabled: true,
+                sort_order: 0,
+                agent_id_override: Some("claude"),
+                last_used_at: None,
+            },
+        )
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_preset_auto",
-            last_model_id: None,
-            last_permission_value: None,
-            last_thought_level_value: None,
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user-1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_preset_auto",
+                last_model_id: None,
+                last_permission_value: None,
+                last_thought_level_value: None,
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -7370,7 +8195,11 @@ async fn create_with_auto_builtin_defaults_without_preferences_keeps_snapshot_va
     assert!(resp.extra.get("permission_mode").is_none());
     assert!(resp.extra.get("assistant_snapshot").is_none());
 
-    let updated_pref = preference_repo.get("asstdef_preset_auto").await.unwrap().unwrap();
+    let updated_pref = preference_repo
+        .get_for_user("user-1", "asstdef_preset_auto")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(updated_pref.last_model_id, None);
     assert_eq!(updated_pref.last_permission_value, None);
     assert_eq!(updated_pref.last_mcp_ids, "[]");
@@ -7584,6 +8413,9 @@ async fn get_backfills_legacy_row_and_persists() {
         pinned_at: None,
         created_at: 0,
         updated_at: 0,
+        project_id: None,
+        folder_id: None,
+        name_source: None,
     };
     repo.create(&legacy_row).await.unwrap();
 
@@ -7598,7 +8430,7 @@ async fn get_backfills_legacy_row_and_persists() {
     assert_eq!(resp2.extra["skills"], json!(["cron", "pdf"]));
 
     // Verify the row on disk was persisted with the new shape.
-    let persisted = repo.get("legacy-1").await.unwrap().unwrap();
+    let persisted = repo.get("user-1", "legacy-1").await.unwrap().unwrap();
     let persisted_extra: serde_json::Value = serde_json::from_str(&persisted.extra).unwrap();
     assert_eq!(persisted_extra["skills"], json!(["cron", "pdf"]));
     assert!(persisted_extra.get("enabled_skills").is_none());
@@ -7632,6 +8464,9 @@ async fn list_backfills_mixed_rows() {
         pinned_at: None,
         created_at: 1,
         updated_at: 1,
+        project_id: None,
+        folder_id: None,
+        name_source: None,
     };
     // Row 2: already migrated.
     let modern = ConversationRow {
@@ -7652,6 +8487,9 @@ async fn list_backfills_mixed_rows() {
         pinned_at: None,
         created_at: 2,
         updated_at: 2,
+        project_id: None,
+        folder_id: None,
+        name_source: None,
     };
     repo.create(&legacy).await.unwrap();
     repo.create(&modern).await.unwrap();
@@ -7719,9 +8557,10 @@ async fn insert_raw_message_persists_row_and_broadcasts_stream() {
         status: Some("finish".into()),
         hidden: false,
         created_at: 1234,
+        backend_turn_id: None,
     };
 
-    svc.insert_raw_message(&row).await.unwrap();
+    svc.insert_raw_message("user_1", &row).await.unwrap();
 
     let stored = repo.messages.lock().unwrap().clone();
     assert_eq!(stored.len(), 1, "row must be persisted via repo.insert_message");
@@ -7769,27 +8608,33 @@ async fn seed_aionrs_conversation_with_snapshot(
         pinned_at: None,
         created_at: 1,
         updated_at: 1,
+        project_id: None,
+        folder_id: None,
+        name_source: None,
     };
     repo.create(&row).await.unwrap();
-    repo.upsert_assistant_snapshot(&UpsertConversationAssistantSnapshotParams {
-        conversation_id: &row.id,
-        assistant_definition_id: "asstdef-seed",
-        assistant_id: "assistant-seed",
-        assistant_source: "builtin",
-        agent_id: "agent-seed",
-        rules_content: "",
-        default_model_mode: "auto",
-        resolved_model_id: None,
-        default_permission_mode,
-        resolved_permission_value,
-        default_thought_level_mode: "auto",
-        resolved_thought_level_value: None,
-        default_skills_mode: "auto",
-        resolved_skill_ids: "[]",
-        resolved_disabled_builtin_skill_ids: "[]",
-        default_mcps_mode: "auto",
-        resolved_mcp_ids: "[]",
-    })
+    repo.upsert_assistant_snapshot(
+        &row.user_id,
+        &UpsertConversationAssistantSnapshotParams {
+            conversation_id: &row.id,
+            assistant_definition_id: "asstdef-seed",
+            assistant_id: "assistant-seed",
+            assistant_source: "builtin",
+            agent_id: "agent-seed",
+            rules_content: "",
+            default_model_mode: "auto",
+            resolved_model_id: None,
+            default_permission_mode,
+            resolved_permission_value,
+            default_thought_level_mode: "auto",
+            resolved_thought_level_value: None,
+            default_skills_mode: "auto",
+            resolved_skill_ids: "[]",
+            resolved_disabled_builtin_skill_ids: "[]",
+            default_mcps_mode: "auto",
+            resolved_mcp_ids: "[]",
+        },
+    )
     .await
     .unwrap();
     row
@@ -7798,7 +8643,7 @@ async fn seed_aionrs_conversation_with_snapshot(
 fn aionrs_session_mode(options: &BuildTaskOptions) -> Option<String> {
     match &options.context.kind {
         AgentSessionKind::Aionrs(ctx) => ctx.config.session_mode.clone(),
-        AgentSessionKind::Acp(_) => panic!("expected Aionrs build options"),
+        AgentSessionKind::Acp(_) | AgentSessionKind::Antigravity(_) => panic!("expected Aionrs build options"),
     }
 }
 
@@ -7887,4 +8732,80 @@ async fn cron_required_runtime_mode_wins_over_resolved_permission_seed() {
         &[("mode".to_owned(), "default".to_owned())],
         "cron required-runtime-mode must override the rebuild permission seed"
     );
+}
+
+#[tokio::test]
+async fn get_usage_reads_the_persisted_snapshot_when_no_task_is_live() {
+    // The usage indicator has to survive switching away from a conversation and
+    // back. The task is reaped when the session goes idle, and requiring a live
+    // one here made the figure vanish exactly then — the snapshot is durable in
+    // `acp_session.session_config.runtime.context_usage` precisely so a cold
+    // read can serve it.
+    let acp_repo = Arc::new(StubAcpSessionRepo::default());
+    *acp_repo.runtime_state.lock().unwrap() = Some(PersistedSessionState {
+        context_usage_json: Some(r#"{"used":10465}"#.to_owned()),
+        ..Default::default()
+    });
+    let (svc, _broadcaster, repo, _task_mgr) =
+        make_service_with_resolver_and_acp_session_repo(Arc::new(FixedSkillResolver { names: vec![] }), acp_repo);
+    // No task is ever registered for this conversation — the cold path.
+    let conv = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+
+    let usage = svc.get_usage("user_1", &conv.id).await.expect("cold read failed");
+    assert_eq!(
+        usage.and_then(|v| v.get("used").and_then(|u| u.as_i64())),
+        Some(10465),
+        "a reaped task must not blank the usage indicator"
+    );
+}
+
+#[tokio::test]
+async fn cancel_during_the_build_is_recorded_instead_of_dropped() {
+    // The turn is live — its id matches — but the agent has not registered yet,
+    // because building one runs real work first (an Antigravity build probes
+    // models, checks the CLI version, installs its permission hook). Returning a
+    // bare runtime summary here loses the request: the turn runs to completion
+    // while the UI has already reported it as stopped. See #746.
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let slow = Arc::new(SlowBuildTaskManager::new(Duration::from_millis(1_500)));
+    let task_mgr: Arc<dyn IWorkerTaskManager> = slow.clone();
+
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let send = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
+
+    // No task is registered yet: this is the window the bug lived in.
+    assert!(
+        task_mgr.get_task(&conv.id).is_none(),
+        "test needs the pre-registration window"
+    );
+
+    svc.cancel("user_1", &conv.id, &send.turn_id, &task_mgr).await.unwrap();
+
+    assert!(
+        svc.runtime_state().take_deferred_cancel(&conv.id, &send.turn_id),
+        "the cancel must be remembered so the orchestrator can apply it when the task appears"
+    );
+    assert!(
+        !svc.runtime_state().is_cancelling(&conv.id),
+        "it must NOT reuse the ordinary cancelling flag: that one is also set when the \
+         agent was handed the cancel directly, and the orchestrator would then abort turns \
+         whose cancel is already being handled"
+    );
+}
+
+#[tokio::test]
+async fn a_deferred_cancel_does_not_leak_into_a_later_turn() {
+    // The record is keyed by turn: one left behind must never abort the next
+    // turn the user starts.
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    svc.runtime_state().defer_cancel(&conv.id, "turn_old");
+    assert!(!svc.runtime_state().take_deferred_cancel(&conv.id, "turn_new"));
+    assert!(svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
+    // Consumed exactly once.
+    assert!(!svc.runtime_state().take_deferred_cancel(&conv.id, "turn_old"));
 }

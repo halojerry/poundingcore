@@ -18,7 +18,7 @@ pub use session_updates::{
 pub use tool_call::{
     AcpToolCallContentItem, AcpToolCallEventData, AcpToolCallKind, AcpToolCallLocationItem,
     AcpToolCallSessionUpdateKind, AcpToolCallStatus, AcpToolCallTextBlock, AcpToolCallTextBlockType,
-    AcpToolCallUpdateData, ToolCallEventData, ToolCallStatus, ToolGroupEntry,
+    AcpToolCallUpdateData, ToolCallEventData, ToolCallStatus, ToolGroupEntry, ToolGroupStatus,
 };
 pub(crate) use translate::{permission_request_to_event_data, session_notification_to_events};
 
@@ -64,6 +64,39 @@ pub enum AgentStreamEvent {
     /// under one turn). The relay consumes it internally and never forwards it
     /// to the WebSocket, so no frontend renderer is required.
     SegmentBreak,
+    /// Internal-only: the backend's OWN id for the turn that just started
+    /// (codex `turn/started` → `Turn.id`). The relay consumes it to stamp
+    /// `messages.backend_turn_id` on every row it persists for this turn — the
+    /// lookup key for `thread/fork`'s `lastTurnId` when forking mid-history.
+    /// Never forwarded to the WebSocket; never user-visible output. Only the
+    /// direct-CLI codex pump emits it.
+    BackendTurnBound(String),
+    /// Internal-only: one snapshot of a running workflow's progress.
+    ///
+    /// NOT forwarded to the WebSocket as-is. The relay projects it into the two
+    /// frames the frontend ALREADY renders — a `tool_call` (the container row:
+    /// headline in `description`, full phase tree in `output`) and a `tool_group`
+    /// (one entry per workflow agent, each with its own status badge) — so no new
+    /// frontend renderer is required.
+    ///
+    /// It exists as its own variant purely so the relay can special-case it:
+    /// a plain `ToolCall`/`ToolGroup` makes the relay close the active text
+    /// segment, and a workflow emits progress WHILE the assistant is streaming
+    /// its "workflow started" reply (claude runs with `--include-partial-messages`,
+    /// so that reply arrives as deltas). Reusing those variants would therefore
+    /// shatter that reply into one bubble per progress frame. The relay's arm for
+    /// this variant leaves `active_text`/`active_thinking` untouched.
+    ///
+    /// Never counts as user-visible turn output (see `event_is_user_visible_output`):
+    /// it is an out-of-band status refresh, not the turn "saying something".
+    WorkflowProgress(WorkflowProgressData),
+    /// Internal-only signal: the tolerant transport layer absorbed a CodeBuddy
+    /// dialect notification (`session_end` / `compact-maxtoken`) that the stock
+    /// ACP schema hard-rejects as `-32602`. Consumed by the empty-turn judgment
+    /// within the turn/near-window; never counts as user-visible output and is
+    /// never forwarded to the WebSocket. Mirrors `SegmentBreak`'s "relay consumes
+    /// internally, never forwards" contract.
+    AcpDialectSignal(AcpDialectSignalData),
 }
 
 /// Data for the `Start` event.
@@ -114,10 +147,56 @@ pub struct FinishEventData {
     pub session_id: Option<String>,
 }
 
+/// Kind of CodeBuddy ACP dialect signal absorbed by the tolerant transport
+/// layer before the stock ACP schema can hard-reject it as `-32602`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcpDialectSignalKind {
+    /// Non-standard `session_end` terminal marker (carries `stopReason:"end_turn"`).
+    SessionEnd,
+    /// Emergency auto-compaction / max-token pressure notification
+    /// (`compact-maxtoken` message id or `codebuddy.ai/compactType` meta marker).
+    TokenPressure,
+}
+
+/// Data for the internal-only [`AgentStreamEvent::WorkflowProgress`] event.
+///
+/// Carries both projections precomputed by the pump, so the relay stays a dumb
+/// forwarder: it never has to know how a workflow renders.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowProgressData {
+    /// The container row, keyed by the Workflow tool call's `call_id` so it
+    /// updates the card the user already sees. Emitted as a `tool_call` frame.
+    pub card: ToolCallEventData,
+    /// One entry per workflow agent. Emitted as a `tool_group` frame.
+    ///
+    /// ALWAYS the FULL roster, never a delta: `persist_tool_group` replaces the
+    /// whole row's content and keys it by the FIRST entry's `call_id`, so a
+    /// partial list would erase the agents left out, and a reordered list would
+    /// insert a second row.
+    pub agents: Vec<ToolGroupEntry>,
+    /// A status-only settle for a card THIS pump never opened — the CLI reported
+    /// a task terminal after a resume/rebuild wiped the ledger (live 2026-08-04:
+    /// an idle-killed conversation's load-gate bash finished its work, and the
+    /// resumed session's `Interrupted` report found no card — the stored row
+    /// spun forever). Consumers must apply it ONLY to an EXISTING stored row
+    /// (update, never insert, never a fresh UI card): the same unknown-terminal
+    /// shape also fires for workflow-INTERNAL refs that never had a row, and
+    /// inserting for those would conjure junk cards.
+    #[serde(default)]
+    pub settle_only: bool,
+}
+
+/// Data for the internal-only [`AgentStreamEvent::AcpDialectSignal`] event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpDialectSignalData {
+    pub kind: AcpDialectSignalKind,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v1::{
         PermissionOption, PermissionOptionKind as SdkPermissionOptionKind, RequestPermissionRequest,
         SessionNotification, SessionUpdate, ToolCall as SdkToolCall, ToolCallStatus as SdkToolCallStatus,
         ToolCallUpdate as SdkToolCallUpdate, ToolCallUpdateFields, ToolKind as SdkToolKind,
@@ -263,13 +342,13 @@ mod tests {
             ToolGroupEntry {
                 call_id: "c1".into(),
                 name: "read".into(),
-                status: ToolCallStatus::Completed,
+                status: ToolGroupStatus::Success,
                 description: Some("Read file".into()),
             },
             ToolGroupEntry {
                 call_id: "c2".into(),
                 name: "write".into(),
-                status: ToolCallStatus::Running,
+                status: ToolGroupStatus::Executing,
                 description: None,
             },
         ];

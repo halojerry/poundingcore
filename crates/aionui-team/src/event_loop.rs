@@ -339,7 +339,7 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
         }
     }
 
-    match ctx.scheduler.finalize_turn(&ctx.slot_id, &[]).await {
+    match ctx.scheduler.finalize_turn(&ctx.slot_id).await {
         Ok(Some(wake_target)) if wake_target != ctx.slot_id => {
             if let Err(error) = ctx
                 .session
@@ -370,7 +370,11 @@ async fn mark_batch_messages_read(ctx: &AgentLoopContext, batch: &WorkBatch) {
     if batch.mailbox_message_ids.is_empty() {
         return;
     }
-    if let Err(error) = ctx.mailbox.mark_read_batch(&batch.mailbox_message_ids).await {
+    if let Err(error) = ctx
+        .mailbox
+        .mark_read_batch(&ctx.team_id, &batch.mailbox_message_ids)
+        .await
+    {
         warn!(
             team_id = %ctx.team_id,
             slot_id = %ctx.slot_id,

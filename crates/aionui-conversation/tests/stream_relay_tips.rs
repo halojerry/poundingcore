@@ -32,6 +32,9 @@ async fn setup_repo() -> (Arc<SqliteConversationRepository>, aionui_db::Database
         pinned_at: None,
         created_at: now,
         updated_at: now,
+        project_id: None,
+        folder_id: None,
+        name_source: None,
     })
     .await
     .unwrap();
@@ -68,6 +71,7 @@ async fn persist_info_tip_preserves_code_and_params() {
 
     let messages = repo
         .list_messages_page(
+            "system_default_user",
             "conv-1",
             &MessagePageParams {
                 limit: 100,

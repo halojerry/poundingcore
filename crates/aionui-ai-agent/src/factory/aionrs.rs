@@ -62,6 +62,7 @@ pub(super) async fn build(
         for (name, config) in load_user_mcp_servers(
             repo.as_ref(),
             overrides.mcp_server_ids.as_deref(),
+            &ctx.user_id,
             &ctx.conversation_id,
             deps.broadcaster.clone(),
         )
@@ -73,6 +74,7 @@ pub(super) async fn build(
     merge_session_snapshot_mcp_servers(
         &mut extra_mcp_servers,
         &overrides.session_mcp_servers,
+        &ctx.user_id,
         &ctx.conversation_id,
         deps.broadcaster.clone(),
     )
@@ -90,7 +92,7 @@ pub(super) async fn build(
     let provider_id = &model.provider_id;
     let row = deps
         .provider_repo
-        .find_by_id(provider_id)
+        .find_by_id(&ctx.user_id, provider_id)
         .await
         .map_err(|e| AgentError::internal(format!("Failed to load provider config: {e}")))?
         .ok_or_else(|| AgentError::bad_request(format!("Provider '{provider_id}' not found")))?;
@@ -451,12 +453,13 @@ pub(crate) fn resolve_bedrock_config(json: Option<&str>) -> Option<aion_config::
 async fn load_user_mcp_servers(
     repo: &dyn IMcpServerRepository,
     selected_ids: Option<&[String]>,
+    user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) -> HashMap<String, McpServerConfig> {
     let rows_result = match selected_ids {
-        Some(ids) => repo.list_by_ids_any(ids).await,
-        None => repo.list().await,
+        Some(ids) => repo.list_by_ids_any(user_id, ids).await,
+        None => repo.list(user_id).await,
     };
     let rows = match rows_result {
         Ok(r) => r,
@@ -483,7 +486,7 @@ async fn load_user_mcp_servers(
             continue;
         }
 
-        match row_to_mcp_server_config(&row, conversation_id, broadcaster.clone()).await {
+        match row_to_mcp_server_config(&row, user_id, conversation_id, broadcaster.clone()).await {
             Ok(config) => {
                 servers.insert(row.name.clone(), config);
             }
@@ -504,6 +507,7 @@ async fn load_user_mcp_servers(
 
 async fn row_to_mcp_server_config(
     row: &McpServerRow,
+    user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) -> Result<McpServerConfig, String> {
@@ -531,7 +535,7 @@ async fn row_to_mcp_server_config(
                 })
                 .unwrap_or_default();
             let (resolved_command, args, env) =
-                ensure_stdio_launch(command, &args, &env_entries, conversation_id, broadcaster).await?;
+                ensure_stdio_launch(command, &args, &env_entries, user_id, conversation_id, broadcaster).await?;
 
             Ok(McpServerConfig {
                 transport: TransportType::Stdio,
@@ -602,6 +606,7 @@ async fn row_to_mcp_server_config(
 
 async fn session_server_to_mcp_server_config(
     server: &SessionMcpServer,
+    user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) -> Result<McpServerConfig, String> {
@@ -612,7 +617,7 @@ async fn session_server_to_mcp_server_config(
             }
             let entries: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             let (command, args, env) =
-                ensure_stdio_launch(command, args, &entries, conversation_id, broadcaster).await?;
+                ensure_stdio_launch(command, args, &entries, user_id, conversation_id, broadcaster).await?;
             Ok(McpServerConfig {
                 transport: TransportType::Stdio,
                 command: Some(command),
@@ -675,11 +680,12 @@ async fn session_server_to_mcp_server_config(
 async fn merge_session_snapshot_mcp_servers(
     extra_mcp_servers: &mut HashMap<String, McpServerConfig>,
     session_mcp_servers: &[SessionMcpServer],
+    user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) {
     for server in session_mcp_servers {
-        match session_server_to_mcp_server_config(server, conversation_id, broadcaster.clone()).await {
+        match session_server_to_mcp_server_config(server, user_id, conversation_id, broadcaster.clone()).await {
             Ok(config) => {
                 if extra_mcp_servers.insert(server.name.clone(), config).is_some() {
                     debug!(
@@ -706,10 +712,11 @@ async fn ensure_stdio_launch(
     command: &str,
     args: &[String],
     env: &[(String, String)],
+    user_id: &str,
     conversation_id: &str,
     broadcaster: Arc<dyn aionui_realtime::EventBroadcaster>,
 ) -> Result<(String, Vec<String>, HashMap<String, String>), String> {
-    let reporter = conversation_runtime_reporter(broadcaster, conversation_id.to_owned());
+    let reporter = conversation_runtime_reporter(broadcaster, user_id.to_owned(), conversation_id.to_owned());
     let resolved = ensure_runtime_command_with_reporter(command, Some(reporter.as_ref()))
         .await
         .map_err(|error| error.to_string())?;
@@ -773,6 +780,8 @@ mod tests {
         mem,
         path::{Path, PathBuf},
     };
+
+    const TEST_USER_ID: &str = "user-1";
 
     fn path_test_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -873,6 +882,7 @@ mod tests {
     ) -> McpServerRow {
         McpServerRow {
             id: format!("mcp_{name}"),
+            user_id: TEST_USER_ID.to_owned(),
             name: name.to_owned(),
             description: None,
             enabled,
@@ -895,16 +905,24 @@ mod tests {
 
     #[async_trait::async_trait]
     impl IMcpServerRepository for MockMcpRepo {
-        async fn list(&self) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
-            Ok(self.rows.clone())
+        async fn list(&self, user_id: &str) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
+            Ok(self.rows.iter().filter(|row| row.user_id == user_id).cloned().collect())
         }
 
-        async fn find_by_id(&self, id: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
-            Ok(self.rows.iter().find(|row| row.id == id).cloned())
+        async fn find_by_id(&self, user_id: &str, id: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.user_id == user_id && row.id == id)
+                .cloned())
         }
 
-        async fn find_by_name(&self, name: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
-            Ok(self.rows.iter().find(|row| row.name == name).cloned())
+        async fn find_by_name(&self, user_id: &str, name: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+            Ok(self
+                .rows
+                .iter()
+                .find(|row| row.user_id == user_id && row.name == name)
+                .cloned())
         }
 
         async fn create(
@@ -916,18 +934,20 @@ mod tests {
 
         async fn update(
             &self,
+            _user_id: &str,
             _id: &str,
             _params: aionui_db::UpdateMcpServerParams<'_>,
         ) -> Result<McpServerRow, aionui_db::DbError> {
             unimplemented!("not needed for factory tests")
         }
 
-        async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
             unimplemented!("not needed for factory tests")
         }
 
         async fn batch_upsert(
             &self,
+            _user_id: &str,
             _servers: &[aionui_db::CreateMcpServerParams<'_>],
         ) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
             unimplemented!("not needed for factory tests")
@@ -935,6 +955,7 @@ mod tests {
 
         async fn update_status(
             &self,
+            _user_id: &str,
             _id: &str,
             _status: &str,
             _last_connected: Option<aionui_common::TimestampMs>,
@@ -942,7 +963,12 @@ mod tests {
             unimplemented!("not needed for factory tests")
         }
 
-        async fn update_tools(&self, _id: &str, _tools: Option<&str>) -> Result<(), aionui_db::DbError> {
+        async fn update_tools(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _tools: Option<&str>,
+        ) -> Result<(), aionui_db::DbError> {
             unimplemented!("not needed for factory tests")
         }
     }
@@ -964,8 +990,14 @@ mod tests {
         let repo = MockMcpRepo { rows: vec![row] };
         let selected = vec!["mcp-docs".to_owned()];
 
-        let extra_mcp_servers =
-            load_user_mcp_servers(&repo, Some(&selected), "conv-frozen-mcp", test_broadcaster()).await;
+        let extra_mcp_servers = load_user_mcp_servers(
+            &repo,
+            Some(&selected),
+            TEST_USER_ID,
+            "conv-frozen-mcp",
+            test_broadcaster(),
+        )
+        .await;
 
         assert!(extra_mcp_servers.contains_key("mcp-docs"));
         assert_eq!(extra_mcp_servers["mcp-docs"].transport, TransportType::StreamableHttp);
@@ -988,7 +1020,7 @@ mod tests {
             false,
         );
 
-        let config = row_to_mcp_server_config(&row, "conv-row", test_broadcaster())
+        let config = row_to_mcp_server_config(&row, "user-row", "conv-row", test_broadcaster())
             .await
             .expect("convert");
         let command = config.command.as_deref().expect("resolved command");
@@ -1821,7 +1853,14 @@ mod tests {
             },
         }];
 
-        merge_session_snapshot_mcp_servers(&mut servers, &snapshot, "conv-override", test_broadcaster()).await;
+        merge_session_snapshot_mcp_servers(
+            &mut servers,
+            &snapshot,
+            "user-override",
+            "conv-override",
+            test_broadcaster(),
+        )
+        .await;
 
         let server = servers.get("demo-mcp").expect("snapshot should remain");
         assert_eq!(server.transport, TransportType::Stdio);

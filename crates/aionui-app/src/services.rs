@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::{AppConfig, derive_encryption_key};
+use crate::config::{AppConfig, IdentityMode, derive_encryption_key};
 use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
     RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
@@ -13,11 +13,12 @@ use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    IProjectStore, ISkillRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantPreferenceRepository,
-    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProviderRepository, SqliteSkillRepository,
-    SqliteUserRepository,
+    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProjectStore, SqliteProviderRepository,
+    SqliteSkillRepository, SqliteUserRepository,
 };
+use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 
 pub struct AppServices {
@@ -33,6 +34,9 @@ pub struct AppServices {
     pub runtime_token_service: Arc<RuntimeTokenService>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
+    /// Project-bind service (project-bind side branch). Shared by conversation
+    /// and team wiring to bind/backfill project/folder rows. Cheap to clone.
+    pub project_service: ProjectService,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -48,6 +52,8 @@ pub struct AppServices {
     pub work_dir: PathBuf,
     /// When `true`, skip JWT authentication and use a fixed default user.
     pub local: bool,
+    pub identity_mode: IdentityMode,
+    pub bootstrap_secret: Option<Arc<str>>,
     pub app_version: String,
     /// Resolved skill paths. Shared with the `ConversationService` for
     /// snapshot resolution at create time.
@@ -56,6 +62,8 @@ pub struct AppServices {
     pub skill_repo: Arc<dyn ISkillRepository>,
     runtime_helper_bin: String,
     runtime_base_url: String,
+    /// Shared with the Antigravity hook endpoint so it can authenticate callbacks.
+    pub(crate) antigravity_hook_tokens: Arc<aionui_ai_agent::antigravity_hook::HookTokenRegistry>,
 }
 
 impl AppServices {
@@ -85,6 +93,7 @@ impl AppServices {
             runtime_helper_bin: self.runtime_helper_bin.clone(),
             runtime_base_url: self.runtime_base_url.clone(),
             runtime_token_service: self.runtime_token_service.clone(),
+            project_service: self.project_service.clone(),
         });
         self
     }
@@ -92,7 +101,8 @@ impl AppServices {
     pub async fn from_config(database: Database, config: &AppConfig) -> anyhow::Result<Self> {
         let data_dir = config.data_dir.clone();
         let work_dir = config.work_dir.clone();
-        let local = config.local;
+        let identity_mode = config.effective_identity_mode();
+        let local = identity_mode.is_local();
         let dump_prompts = config.dump_prompts;
         let app_version = config.app_version.clone();
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
@@ -110,6 +120,26 @@ impl AppServices {
             .filter(|s| !s.is_empty());
 
         let (secret, is_new) = resolve_jwt_secret(env_secret.as_deref(), db_secret);
+
+        // Defense-in-depth for the encryption key: generating a NEW secret is
+        // only legitimate on a genuinely fresh install. If the read path
+        // claimed "no system user" while the row actually exists (as happened
+        // when a stale post-migration connection mis-decoded the users table,
+        // ELECTRON-3T0), deriving a fresh key would silently break decryption
+        // of every stored credential. Verify absence with an independent
+        // query and fail startup instead of corrupting.
+        if is_new
+            && system_user.is_none()
+            && user_repo
+                .find_by_id("system_default_user")
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to verify system user absence: {e}"))?
+                .is_some()
+        {
+            anyhow::bail!(
+                "system user row exists but could not be read; refusing to generate a new                  JWT secret (would break decryption of stored credentials)"
+            );
+        }
 
         // Persist newly generated secret to database
         if is_new && let Some(user) = &system_user {
@@ -136,6 +166,9 @@ impl AppServices {
             .hydrate()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to hydrate agent registry: {e}"))?;
+        // Settle any slow version probes off the readiness path (#675):
+        // hydrate never waits beyond the inline budget per agent.
+        agent_registry.spawn_slow_probe_recheck();
 
         let acp_session_repo: Arc<dyn IAcpSessionRepository> =
             Arc::new(SqliteAcpSessionRepository::new(database.pool().clone()));
@@ -144,6 +177,13 @@ impl AppServices {
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
         let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
+
+        // Project-bind service (side branch). temp_root mirrors the existing
+        // conversation temp-workspace root (`work_dir/conversations`) so
+        // `resolve_existing` classifies auto workspaces as temp and
+        // user-picked directories as standard.
+        let project_store: Arc<dyn IProjectStore> = Arc::new(SqliteProjectStore::new(database.pool().clone()));
+        let project_service = ProjectService::new(project_store, work_dir.join("conversations"));
 
         // Skill paths need app resource dir (for builtin rules) + data dir
         // (for user skills + materialized views). AcpSkillManager uses these
@@ -154,9 +194,18 @@ impl AppServices {
             .and_then(|p| p.parent().map(|pp| pp.to_path_buf()))
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         let skill_paths = Arc::new(aionui_extension::resolve_skill_paths(&app_resource_dir, &data_dir));
-        aionui_extension::sync_skill_catalog_into_repo(skill_paths.as_ref(), skill_repo.as_ref())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
+        if identity_mode.is_local() {
+            aionui_extension::sync_skill_catalog_into_repo(skill_paths.as_ref(), skill_repo.as_ref())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
+        } else {
+            // AionPro: never ingest the legacy shared skill directory — its
+            // files carry no account attribution and would only create rows
+            // for the never-logged-in local default user.
+            aionui_extension::sync_builtin_skill_catalog_into_repo(skill_paths.as_ref(), skill_repo.as_ref())
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to synchronize skill catalog: {e}"))?;
+        }
 
         // Absolute path to this process's binary. Reused as the `command` for
         // the stdio MCP bridge spawned by ACP CLIs when a team session is
@@ -165,6 +214,7 @@ impl AppServices {
             Arc::new(std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("poundingcore")));
         let runtime_helper_bin = backend_binary_path.to_string_lossy().into_owned();
         let runtime_base_url = config.local_base_url();
+        let antigravity_hook_tokens = Arc::new(aionui_ai_agent::antigravity_hook::HookTokenRegistry::new());
 
         // Session-model port: the subprocess spawner the clean-slate claude/codex
         // SessionBackend uses. Registry-backed (feature 001) so spawned processes are
@@ -191,6 +241,11 @@ impl AppServices {
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),
             session_spawner,
+            // agy cannot prompt for tool permission in headless mode, so AionUi
+            // registers itself as its PreToolUse hook; the hook process calls
+            // back here to raise the user's permission card.
+            antigravity_hook_base_url: Some(runtime_base_url.clone()),
+            antigravity_hook_tokens: antigravity_hook_tokens.clone(),
         });
 
         // Agent factory is now wired. Future extension/custom agents
@@ -218,11 +273,13 @@ impl AppServices {
             runtime_helper_bin: runtime_helper_bin.clone(),
             runtime_base_url: runtime_base_url.clone(),
             runtime_token_service: runtime_token_service.clone(),
+            project_service: project_service.clone(),
         });
 
         Ok(Self {
             database,
             jwt_service: Arc::new(JwtService::new(secret.clone())),
+            antigravity_hook_tokens,
             user_repo,
             cookie_config: Arc::new(CookieConfig::from_env()),
             qr_token_store: Arc::new(QrTokenStore::new()),
@@ -233,6 +290,7 @@ impl AppServices {
             runtime_token_service,
             conversation_runtime_state,
             conversation_service,
+            project_service,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,
@@ -242,6 +300,8 @@ impl AppServices {
             dump_prompts,
             work_dir,
             local,
+            identity_mode,
+            bootstrap_secret: config.bootstrap_secret.clone().map(Arc::<str>::from),
             app_version,
             skill_paths,
             skill_repo,
@@ -264,6 +324,7 @@ struct ConversationServiceDeps<'a> {
     runtime_helper_bin: String,
     runtime_base_url: String,
     runtime_token_service: Arc<RuntimeTokenService>,
+    project_service: ProjectService,
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
@@ -296,6 +357,7 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     if let Some(hook) = deps.task_manager_delete_hook {
         service.with_delete_hook(hook);
     }
+    service.with_project_service(Arc::new(deps.project_service));
     service
 }
 

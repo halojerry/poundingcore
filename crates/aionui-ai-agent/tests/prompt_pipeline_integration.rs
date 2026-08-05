@@ -51,11 +51,13 @@ async fn fixture_params(
         mcp_server_ids: None,
         session_mcp_servers: vec![],
         user_id: None,
+        fork: None,
     };
 
     Arc::new(
         assemble_acp_params(
             "conv-pp-test".into(),
+            "user-pp-test".into(),
             WorkspaceInfo {
                 path: "/tmp".into(),
                 is_custom: is_custom_workspace,

@@ -1,20 +1,42 @@
 use std::sync::Arc;
 
+use aionui_api_types::TeamMailboxChange;
 use aionui_common::{generate_id, now_ms};
 use aionui_db::ITeamRepository;
 use aionui_db::models::MailboxMessageRow;
 use tracing::debug;
 
+use crate::activity_mapping::mailbox_row_to_response;
 use crate::error::TeamError;
+use crate::events::TeamEventEmitter;
 use crate::types::{MailboxMessage, MailboxMessageType};
 
 pub struct Mailbox {
     repo: Arc<dyn ITeamRepository>,
+    /// Optional real-time emitter. When present, mailbox writes and read-marks
+    /// broadcast `team.mailboxChanged`. Absent in unit tests that use
+    /// [`Mailbox::new`] directly.
+    events: Option<Arc<TeamEventEmitter>>,
+    user_id: String,
 }
 
 impl Mailbox {
     pub fn new(repo: Arc<dyn ITeamRepository>) -> Self {
-        Self { repo }
+        Self::new_for_user(repo, "system_default_user")
+    }
+
+    pub fn new_for_user(repo: Arc<dyn ITeamRepository>, user_id: impl Into<String>) -> Self {
+        Self {
+            repo,
+            events: None,
+            user_id: user_id.into(),
+        }
+    }
+
+    /// Attaches a real-time event emitter for `team.mailboxChanged` broadcasts.
+    pub fn with_events(mut self, events: Arc<TeamEventEmitter>) -> Self {
+        self.events = Some(events);
+        self
     }
 
     pub async fn write(
@@ -57,7 +79,7 @@ impl Mailbox {
             created_at: now_ms(),
         };
 
-        self.repo.write_message(&row).await?;
+        self.repo.write_message(&self.user_id, &row).await?;
 
         debug!(
             team_id,
@@ -67,14 +89,29 @@ impl Mailbox {
             "mailbox message written"
         );
 
+        if let Some(events) = &self.events {
+            events.broadcast_mailbox_changed(mailbox_row_to_response(&row), TeamMailboxChange::Created);
+        }
+
         MailboxMessage::from_row(&row)
             .ok_or_else(|| TeamError::InvalidRequest(format!("invalid message type: {msg_type}")))
     }
 
     pub async fn read_unread(&self, team_id: &str, agent_id: &str) -> Result<Vec<MailboxMessage>, TeamError> {
-        let rows = self.repo.read_unread_and_mark(team_id, agent_id).await?;
+        let rows = self.repo.read_unread_and_mark(&self.user_id, team_id, agent_id).await?;
 
         debug!(team_id, agent_id, count = rows.len(), "mailbox unread messages read");
+
+        // The returned rows reflect the pre-mark state (read=false); they are
+        // now read, so broadcast each as a `read` change. `read_unread` and
+        // `mark_read_batch` are the only two `Read` emission points.
+        if let Some(events) = &self.events {
+            for row in &rows {
+                let mut resp = mailbox_row_to_response(row);
+                resp.read = true;
+                events.broadcast_mailbox_changed(resp, TeamMailboxChange::Read);
+            }
+        }
 
         let messages = rows.iter().filter_map(MailboxMessage::from_row).collect();
         Ok(messages)
@@ -83,15 +120,28 @@ impl Mailbox {
     /// Reads all unread messages without marking them as read.
     /// Used by the drain_mailbox pattern: peek → prompt → mark_read on success.
     pub async fn peek_unread(&self, team_id: &str, agent_id: &str) -> Result<Vec<MailboxMessage>, TeamError> {
-        let rows = self.repo.peek_unread(team_id, agent_id).await?;
+        let rows = self.repo.peek_unread(&self.user_id, team_id, agent_id).await?;
         debug!(team_id, agent_id, count = rows.len(), "mailbox peek_unread");
         let messages = rows.iter().filter_map(MailboxMessage::from_row).collect();
         Ok(messages)
     }
 
     /// Marks the given message IDs as read. Called after successful prompt delivery.
-    pub async fn mark_read_batch(&self, ids: &[String]) -> Result<(), TeamError> {
-        self.repo.mark_read_batch(ids).await?;
+    pub async fn mark_read_batch(&self, team_id: &str, ids: &[String]) -> Result<(), TeamError> {
+        self.repo.mark_read_batch(&self.user_id, team_id, ids).await?;
+
+        // Fetch the (now-read) rows to build full payloads and broadcast one
+        // `read` change per message; the frontend upserts by id idempotently.
+        if let Some(events) = &self.events
+            && !ids.is_empty()
+        {
+            let rows = self.repo.list_messages_by_ids(ids).await?;
+            for row in &rows {
+                let mut resp = mailbox_row_to_response(row);
+                resp.read = true;
+                events.broadcast_mailbox_changed(resp, TeamMailboxChange::Read);
+            }
+        }
         Ok(())
     }
 
@@ -109,7 +159,7 @@ impl Mailbox {
         }
         let count = ids.len();
         if !ids.is_empty() {
-            self.mark_read_batch(&ids).await?;
+            self.mark_read_batch(team_id, &ids).await?;
         }
         Ok(count)
     }
@@ -120,18 +170,23 @@ impl Mailbox {
         agent_id: &str,
         limit: Option<i64>,
     ) -> Result<Vec<MailboxMessage>, TeamError> {
-        let rows = self.repo.get_history(team_id, agent_id, limit).await?;
+        let rows = self.repo.get_history(&self.user_id, team_id, agent_id, limit).await?;
         let messages = rows.iter().filter_map(MailboxMessage::from_row).collect();
         Ok(messages)
     }
 
     pub async fn has_unread(&self, team_id: &str, agent_id: &str) -> Result<bool, TeamError> {
-        let rows = self.repo.get_history(team_id, agent_id, None).await?;
+        let rows = self.repo.get_history(&self.user_id, team_id, agent_id, None).await?;
         Ok(rows.iter().any(|r| !r.read))
     }
 
     pub async fn delete_by_team(&self, team_id: &str) -> Result<(), TeamError> {
-        self.repo.delete_mailbox_by_team(team_id).await?;
+        let row = self
+            .repo
+            .get_team_for_restore(team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
+        self.repo.delete_mailbox_by_team(&row.user_id, team_id).await?;
         debug!(team_id, "mailbox messages deleted for team");
         Ok(())
     }
@@ -141,6 +196,124 @@ impl Mailbox {
 mod tests {
     use super::*;
     use crate::test_utils::MockTeamRepo;
+    use aionui_api_types::{TeamMailboxChangedPayload, WebSocketMessage};
+    use aionui_realtime::EventBroadcaster;
+
+    struct RecordingBroadcaster {
+        events: std::sync::Mutex<Vec<WebSocketMessage<serde_json::Value>>>,
+    }
+
+    impl RecordingBroadcaster {
+        fn new() -> Self {
+            Self {
+                events: std::sync::Mutex::new(vec![]),
+            }
+        }
+
+        fn events(&self) -> Vec<WebSocketMessage<serde_json::Value>> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl EventBroadcaster for RecordingBroadcaster {
+        fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    fn mailbox_with_events(repo: Arc<MockTeamRepo>) -> (Mailbox, Arc<RecordingBroadcaster>) {
+        let bc = Arc::new(RecordingBroadcaster::new());
+        let emitter = Arc::new(TeamEventEmitter::new(
+            "t1".into(),
+            "system_default_user".into(),
+            bc.clone(),
+        ));
+        (Mailbox::new(repo).with_events(emitter), bc)
+    }
+
+    fn mailbox_changes(bc: &RecordingBroadcaster) -> Vec<TeamMailboxChangedPayload> {
+        bc.events()
+            .into_iter()
+            .filter(|e| e.name == "team.mailboxChanged")
+            .map(|e| serde_json::from_value(e.data).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn write_broadcasts_created() {
+        let repo = Arc::new(MockTeamRepo::new());
+        let (mailbox, bc) = mailbox_with_events(repo);
+
+        mailbox
+            .write("t1", "a1", "a2", MailboxMessageType::Message, "hi", None)
+            .await
+            .unwrap();
+
+        let changes = mailbox_changes(&bc);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change, TeamMailboxChange::Created);
+        assert_eq!(changes[0].message.content, "hi");
+        assert!(!changes[0].message.read);
+    }
+
+    #[tokio::test]
+    async fn read_unread_broadcasts_read() {
+        let repo = Arc::new(MockTeamRepo::new());
+        let (mailbox, bc) = mailbox_with_events(repo);
+
+        mailbox
+            .write("t1", "a1", "a2", MailboxMessageType::Message, "m1", None)
+            .await
+            .unwrap();
+        mailbox
+            .write("t1", "a1", "a2", MailboxMessageType::Message, "m2", None)
+            .await
+            .unwrap();
+        mailbox.read_unread("t1", "a1").await.unwrap();
+
+        let read_changes: Vec<_> = mailbox_changes(&bc)
+            .into_iter()
+            .filter(|c| c.change == TeamMailboxChange::Read)
+            .collect();
+        assert_eq!(read_changes.len(), 2);
+        assert!(read_changes.iter().all(|c| c.message.read));
+    }
+
+    #[tokio::test]
+    async fn mark_read_batch_broadcasts_read() {
+        let repo = Arc::new(MockTeamRepo::new());
+        let (mailbox, bc) = mailbox_with_events(repo);
+
+        let m = mailbox
+            .write("t1", "a1", "a2", MailboxMessageType::Message, "m1", None)
+            .await
+            .unwrap();
+        mailbox
+            .mark_read_batch("t1", std::slice::from_ref(&m.id))
+            .await
+            .unwrap();
+
+        let read_changes: Vec<_> = mailbox_changes(&bc)
+            .into_iter()
+            .filter(|c| c.change == TeamMailboxChange::Read)
+            .collect();
+        assert_eq!(read_changes.len(), 1);
+        assert_eq!(read_changes[0].message.id, m.id);
+        assert!(read_changes[0].message.read);
+    }
+
+    #[tokio::test]
+    async fn no_emitter_does_not_panic_and_emits_nothing() {
+        let repo = Arc::new(MockTeamRepo::new());
+        let mailbox = Mailbox::new(repo);
+        let m = mailbox
+            .write("t1", "a1", "a2", MailboxMessageType::Message, "m1", None)
+            .await
+            .unwrap();
+        mailbox.read_unread("t1", "a1").await.unwrap();
+        mailbox.mark_read_batch("t1", &[m.id]).await.unwrap();
+        // No broadcaster attached: nothing to assert beyond not panicking.
+    }
 
     // -- Tests ----------------------------------------------------------------
 

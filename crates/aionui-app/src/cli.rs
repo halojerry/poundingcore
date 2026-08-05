@@ -41,6 +41,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub local: bool,
 
+    /// Identity source mode. AionPro mode requires AIONCORE_BOOTSTRAP_SECRET.
+    #[arg(long, value_enum, default_value_t = IdentityModeArg::Webui)]
+    pub identity_mode: IdentityModeArg,
+
     /// Directory for log files. Defaults to {data-dir}/logs/.
     #[arg(long)]
     pub log_dir: Option<PathBuf>,
@@ -71,6 +75,23 @@ pub(crate) enum ManagedResourcesModeArg {
     Download,
 }
 
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentityModeArg {
+    Local,
+    Webui,
+    Aionpro,
+}
+
+impl From<IdentityModeArg> for aionui_app::IdentityMode {
+    fn from(value: IdentityModeArg) -> Self {
+        match value {
+            IdentityModeArg::Local => Self::Local,
+            IdentityModeArg::Webui => Self::WebUi,
+            IdentityModeArg::Aionpro => Self::AionPro,
+        }
+    }
+}
+
 impl From<ManagedResourcesModeArg> for aionui_runtime::ManagedResourcesMode {
     fn from(value: ManagedResourcesModeArg) -> Self {
         match value {
@@ -94,6 +115,10 @@ pub(crate) enum Command {
     Diagnose(DiagnoseArgs),
     /// Agent-facing Team collaboration CLI fallback.
     Team(TeamArgs),
+    /// PreToolUse permission gate for the Antigravity CLI (spawned by agy).
+    /// Reads the tool request on stdin, asks the running AionUi backend, and
+    /// writes agy's decision to stdout.
+    AntigravityHook,
     /// Stdio ↔ TCP bridge for the team MCP server (spawned by the ACP agent CLI).
     McpBridge,
     /// MCP stdio server for team tools (spawned by the ACP agent CLI).
@@ -115,6 +140,7 @@ impl Command {
             Self::Config(_) => "config",
             Self::Diagnose(_) => "diagnose",
             Self::Team(_) => "team",
+            Self::AntigravityHook => "antigravity-hook",
             Self::McpBridge => "mcp-bridge",
             Self::McpTeamStdio => "mcp-team-stdio",
             Self::Doctor => "doctor",
@@ -711,6 +737,7 @@ mod tests {
             ),
             (Command::McpBridge, "mcp-bridge"),
             (Command::McpTeamStdio, "mcp-team-stdio"),
+            (Command::AntigravityHook, "antigravity-hook"),
             (Command::Doctor, "doctor"),
             (
                 Command::PrepareManagedResources(prepare_args),

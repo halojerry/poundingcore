@@ -35,13 +35,14 @@ use tracing::{info, warn};
 /// reporting) and reserved for that use.
 pub async fn resolve_session_mcp_servers(
     repo: &dyn IMcpServerRepository,
+    user_id: &str,
     selected_ids: Option<&[String]>,
     conversation_id: &str,
     _broadcaster: Arc<dyn EventBroadcaster>,
 ) -> Vec<SessionMcpServer> {
     let rows_result = match selected_ids {
-        Some(ids) => repo.list_by_ids_any(ids).await,
-        None => repo.list().await,
+        Some(ids) => repo.list_by_ids_any(user_id, ids).await,
+        None => repo.list(user_id).await,
     };
     let rows = match rows_result {
         Ok(r) => r,
@@ -177,7 +178,6 @@ fn parse_headers(value: Option<&serde_json::Value>) -> std::collections::HashMap
         })
         .unwrap_or_default()
 }
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -189,6 +189,8 @@ mod tests {
 
     use super::*;
 
+    const TEST_USER_ID: &str = "user-1";
+
     fn make_row(name: &str, enabled: bool, builtin: bool) -> McpServerRow {
         // Use the test executable itself so `ensure_runtime_command` resolves
         // it (ExplicitPath exists) instead of failing the row out.
@@ -198,6 +200,7 @@ mod tests {
             .into_owned();
         McpServerRow {
             id: format!("mcp_{name}"),
+            user_id: TEST_USER_ID.to_owned(),
             name: name.to_owned(),
             description: None,
             enabled,
@@ -220,19 +223,28 @@ mod tests {
 
     #[async_trait]
     impl IMcpServerRepository for MockRepo {
-        async fn list(&self) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
-            Ok(self.rows.clone())
+        async fn list(&self, user_id: &str) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
+            Ok(self.rows.iter().filter(|row| row.user_id == user_id).cloned().collect())
         }
-        async fn find_by_id(&self, _id: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+        async fn find_by_id(&self, _user_id: &str, _id: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
             unimplemented!()
         }
-        async fn find_by_name(&self, _name: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
+        async fn find_by_name(&self, _user_id: &str, _name: &str) -> Result<Option<McpServerRow>, aionui_db::DbError> {
             unimplemented!()
         }
-        async fn list_by_ids_any(&self, ids: &[String]) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
+        async fn list_by_ids_any(
+            &self,
+            user_id: &str,
+            ids: &[String],
+        ) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
             Ok(ids
                 .iter()
-                .filter_map(|id| self.rows.iter().find(|row| row.id == *id).cloned())
+                .filter_map(|id| {
+                    self.rows
+                        .iter()
+                        .find(|row| row.user_id == user_id && row.id == *id)
+                        .cloned()
+                })
                 .collect())
         }
         async fn create(
@@ -243,29 +255,37 @@ mod tests {
         }
         async fn update(
             &self,
+            _user_id: &str,
             _id: &str,
             _params: aionui_db::UpdateMcpServerParams<'_>,
         ) -> Result<McpServerRow, aionui_db::DbError> {
             unimplemented!()
         }
-        async fn delete(&self, _id: &str) -> Result<(), aionui_db::DbError> {
+        async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), aionui_db::DbError> {
             unimplemented!()
         }
         async fn batch_upsert(
             &self,
+            _user_id: &str,
             _servers: &[aionui_db::CreateMcpServerParams<'_>],
         ) -> Result<Vec<McpServerRow>, aionui_db::DbError> {
             unimplemented!()
         }
         async fn update_status(
             &self,
+            _user_id: &str,
             _id: &str,
             _status: &str,
             _last_connected: Option<aionui_common::TimestampMs>,
         ) -> Result<(), aionui_db::DbError> {
             unimplemented!()
         }
-        async fn update_tools(&self, _id: &str, _tools: Option<&str>) -> Result<(), aionui_db::DbError> {
+        async fn update_tools(
+            &self,
+            _user_id: &str,
+            _id: &str,
+            _tools: Option<&str>,
+        ) -> Result<(), aionui_db::DbError> {
             unimplemented!()
         }
     }
@@ -292,7 +312,7 @@ mod tests {
                 make_row("pounding-image-generation", false, true),
             ],
         };
-        let servers = resolve_session_mcp_servers(&repo, None, "conv-1", test_broadcaster()).await;
+        let servers = resolve_session_mcp_servers(&repo, TEST_USER_ID, None, "conv-1", test_broadcaster()).await;
         assert_eq!(names(&servers), vec!["user-enabled", "chrome-devtools"]);
     }
 
@@ -302,7 +322,8 @@ mod tests {
             rows: vec![make_row("pounding-image-generation", false, true)],
         };
         let selected = vec!["mcp_pounding-image-generation".to_owned()];
-        let servers = resolve_session_mcp_servers(&repo, Some(&selected), "conv-2", test_broadcaster()).await;
+        let servers =
+            resolve_session_mcp_servers(&repo, TEST_USER_ID, Some(&selected), "conv-2", test_broadcaster()).await;
         assert_eq!(names(&servers), vec!["pounding-image-generation"]);
     }
 }

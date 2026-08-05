@@ -32,6 +32,12 @@ pub enum SessionSpec {
     /// 0-frame-exits (`No conversation found`); the manager detects that and
     /// falls back to `Fresh` (R16/S17).
     Resume(String),
+    /// Fork off an existing session: resume the PARENT id but have the backend
+    /// copy it into a NEW session instead of appending (claude: `--resume <id>
+    /// --fork-session`; the new id is backend-minted and learned from
+    /// `system/init`). Unlike `Resume`, a missing parent must FAIL, never fall
+    /// back to `Fresh` — the user asked for the parent's context.
+    ForkFrom(String),
 }
 
 /// Narrow process-I/O seam (D2). Exposes only the two methods P0 uses: the
@@ -59,6 +65,14 @@ pub trait AgentIo: Send + Sync {
     async fn peek_stderr(&self, _max_lines: usize) -> String {
         String::new()
     }
+
+    /// Force-terminate the underlying process tree (group-kill), for the
+    /// `UserCancelTimeout` force-kill path. Unlike the Drop-driven reap (which
+    /// needs the LAST `AgentIo` clone released to fire `kill_on_drop`), this
+    /// terminates synchronously even while other clones are still held — the
+    /// in-flight-turn case where an orchestrator retains a handle. Default no-op
+    /// so fakes / non-process IO are unchanged; only `ManagedProcessIo` overrides.
+    async fn terminate(&self) {}
 }
 
 /// How many trailing stderr lines G2 peeks when a backend process exits. The
@@ -102,6 +116,16 @@ impl AgentIo for ManagedProcessIo {
 
     async fn peek_stderr(&self, max_lines: usize) -> String {
         self.proc.peek_stderr_tail(max_lines).await
+    }
+
+    async fn terminate(&self) {
+        // Delegate to the existing graceful group-kill (close stdin → wait
+        // `grace` → group-SIGKILL the whole subtree). 500ms grace mirrors the
+        // ACP force-kill path (`ACP_KILL_GRACE_MS`). A kill failure is a
+        // diagnosable boundary — log and swallow (never panic / propagate).
+        if let Err(err) = self.proc.kill(std::time::Duration::from_millis(500)).await {
+            tracing::warn!(error = %err, "ManagedProcessIo::terminate: group-kill failed");
+        }
     }
 }
 
