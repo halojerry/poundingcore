@@ -2,10 +2,13 @@ use std::sync::Arc;
 
 use aionui_api_types::{
     TeamAgentRemovedPayload, TeamAgentRenamedPayload, TeamAgentRuntimeStatus, TeamAgentRuntimeStatusPayload,
-    TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload, TeamRunPayload, TeamSlotWorkChangedPayload,
-    WebSocketMessage,
+    TeamAgentSpawnedPayload, TeamAgentStatusPayload, TeamChildTurnPayload, TeamMailboxChange,
+    TeamMailboxChangedPayload, TeamMailboxMessageResponse, TeamRunPayload, TeamSlotWorkChangedPayload, TeamTaskChange,
+    TeamTaskChangedPayload, TeamTaskResponse, WebSocketMessage,
 };
 use aionui_realtime::EventBroadcaster;
+use serde::Serialize;
+use serde_json::Value;
 use tracing::{debug, info};
 
 use crate::types::{TeamAgent, TeammateStatus};
@@ -22,6 +25,7 @@ pub const TEAM_REMOVED_EVENT: &str = "team.removed";
 pub const TEAM_RENAMED_EVENT: &str = "team.renamed";
 pub const TEAM_SESSION_STATUS_CHANGED_EVENT: &str = "team.sessionStatusChanged";
 pub const TEAM_TASK_CHANGED_EVENT: &str = "team.taskChanged";
+pub const TEAM_MAILBOX_CHANGED_EVENT: &str = "team.mailboxChanged";
 pub const TEAM_SESSION_CHANGED_EVENT: &str = "team.sessionChanged";
 pub const TEAM_RUN_ACCEPTED_EVENT: &str = "team.runAccepted";
 pub const TEAM_RUN_STARTED_EVENT: &str = "team.runStarted";
@@ -36,16 +40,27 @@ pub const TEAM_SLOT_WORK_CHANGED_EVENT: &str = "team.slotWorkChanged";
 
 pub struct TeamEventEmitter {
     team_id: String,
+    user_id: String,
     broadcaster: Arc<dyn EventBroadcaster>,
 }
 
 impl TeamEventEmitter {
-    pub fn new(team_id: String, broadcaster: Arc<dyn EventBroadcaster>) -> Self {
-        Self { team_id, broadcaster }
+    pub fn new(team_id: String, user_id: String, broadcaster: Arc<dyn EventBroadcaster>) -> Self {
+        Self {
+            team_id,
+            user_id,
+            broadcaster,
+        }
     }
 
     pub fn team_id(&self) -> &str {
         &self.team_id
+    }
+
+    fn scoped_payload<T: Serialize>(&self, payload: T) -> Value {
+        let mut value = serde_json::to_value(payload).expect("serialize team event payload");
+        value["user_id"] = Value::String(self.user_id.clone());
+        value
     }
 
     pub fn broadcast_agent_status(&self, slot_id: &str, status: TeammateStatus) {
@@ -54,10 +69,7 @@ impl TeamEventEmitter {
             slot_id: slot_id.to_owned(),
             status: status.to_string(),
         };
-        let event = WebSocketMessage::new(
-            TEAM_AGENT_STATUS_CHANGED_EVENT,
-            serde_json::to_value(payload).expect("serialize status payload"),
-        );
+        let event = WebSocketMessage::new(TEAM_AGENT_STATUS_CHANGED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -66,10 +78,7 @@ impl TeamEventEmitter {
             team_id: self.team_id.clone(),
             assistant: agent.to_response(),
         };
-        let event = WebSocketMessage::new(
-            TEAM_AGENT_SPAWNED_EVENT,
-            serde_json::to_value(payload).expect("serialize spawned payload"),
-        );
+        let event = WebSocketMessage::new(TEAM_AGENT_SPAWNED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -78,10 +87,7 @@ impl TeamEventEmitter {
             team_id: self.team_id.clone(),
             slot_id: slot_id.to_owned(),
         };
-        let event = WebSocketMessage::new(
-            TEAM_AGENT_REMOVED_EVENT,
-            serde_json::to_value(payload).expect("serialize removed payload"),
-        );
+        let event = WebSocketMessage::new(TEAM_AGENT_REMOVED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -91,10 +97,7 @@ impl TeamEventEmitter {
             slot_id: slot_id.to_owned(),
             name: name.to_owned(),
         };
-        let event = WebSocketMessage::new(
-            TEAM_AGENT_RENAMED_EVENT,
-            serde_json::to_value(payload).expect("serialize renamed payload"),
-        );
+        let event = WebSocketMessage::new(TEAM_AGENT_RENAMED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -123,10 +126,9 @@ impl TeamEventEmitter {
             error = payload.error.as_deref().unwrap_or(""),
             "team member runtime status broadcast"
         );
-        let event = WebSocketMessage::new(
-            TEAM_AGENT_RUNTIME_STATUS_CHANGED_EVENT,
-            serde_json::to_value(payload).expect("serialize agent runtime status payload"),
-        );
+        // Keep per-user scoping so the event is delivered only to the owning
+        // user's WebSocket subscribers.
+        let event = WebSocketMessage::new(TEAM_AGENT_RUNTIME_STATUS_CHANGED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -145,10 +147,7 @@ impl TeamEventEmitter {
             slot_work_count = payload.slot_work.len(),
             "team websocket event emitted"
         );
-        let event = WebSocketMessage::new(
-            event_name,
-            serde_json::to_value(payload).expect("serialize team run payload"),
-        );
+        let event = WebSocketMessage::new(event_name, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -161,10 +160,7 @@ impl TeamEventEmitter {
             active_turn_id = ?payload.slot_work.active_turn_id,
             "team websocket event emitted"
         );
-        let event = WebSocketMessage::new(
-            TEAM_SLOT_WORK_CHANGED_EVENT,
-            serde_json::to_value(payload).expect("serialize team slot work payload"),
-        );
+        let event = WebSocketMessage::new(TEAM_SLOT_WORK_CHANGED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 
@@ -180,10 +176,49 @@ impl TeamEventEmitter {
             status = ?payload.status,
             "team websocket event emitted"
         );
-        let event = WebSocketMessage::new(
-            event_name,
-            serde_json::to_value(payload).expect("serialize team child turn payload"),
+        let event = WebSocketMessage::new(event_name, self.scoped_payload(payload));
+        self.broadcaster.broadcast(event);
+    }
+
+    /// Broadcasts `team.taskChanged` after a task is created or updated.
+    ///
+    /// Only non-sensitive correlation fields (id / change / team_id) are
+    /// logged; subject and description never appear in logs.
+    pub fn broadcast_task_changed(&self, task: TeamTaskResponse, change: TeamTaskChange) {
+        debug!(
+            event_name = TEAM_TASK_CHANGED_EVENT,
+            team_id = %self.team_id,
+            task_id = %task.id,
+            change = ?change,
+            "team websocket event emitted"
         );
+        let payload = TeamTaskChangedPayload {
+            team_id: self.team_id.clone(),
+            task,
+            change,
+        };
+        let event = WebSocketMessage::new(TEAM_TASK_CHANGED_EVENT, self.scoped_payload(payload));
+        self.broadcaster.broadcast(event);
+    }
+
+    /// Broadcasts `team.mailboxChanged` after a message is written or read.
+    ///
+    /// Only non-sensitive correlation fields (id / change / team_id) are
+    /// logged; content and summary never appear in logs.
+    pub fn broadcast_mailbox_changed(&self, message: TeamMailboxMessageResponse, change: TeamMailboxChange) {
+        debug!(
+            event_name = TEAM_MAILBOX_CHANGED_EVENT,
+            team_id = %self.team_id,
+            message_id = %message.id,
+            change = ?change,
+            "team websocket event emitted"
+        );
+        let payload = TeamMailboxChangedPayload {
+            team_id: self.team_id.clone(),
+            message,
+            change,
+        };
+        let event = WebSocketMessage::new(TEAM_MAILBOX_CHANGED_EVENT, self.scoped_payload(payload));
         self.broadcaster.broadcast(event);
     }
 }
@@ -221,7 +256,7 @@ mod tests {
 
     fn make_emitter() -> (TeamEventEmitter, Arc<RecordingBroadcaster>) {
         let bc = Arc::new(RecordingBroadcaster::new());
-        let emitter = TeamEventEmitter::new("team-1".into(), bc.clone());
+        let emitter = TeamEventEmitter::new("team-1".into(), "user-1".into(), bc.clone());
         (emitter, bc)
     }
 
@@ -233,6 +268,7 @@ mod tests {
         let events = bc.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "team.agentStatusChanged");
+        assert_eq!(events[0].data["user_id"], "user-1");
 
         let payload: TeamAgentStatusPayload = serde_json::from_value(events[0].data.clone()).unwrap();
         assert_eq!(payload.team_id, "team-1");
@@ -431,6 +467,9 @@ mod tests {
         let events = bc.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].name, "team.slotWorkChanged");
+        // Must carry user_id so the event-bus → WebSocket bridge delivers it to
+        // the owning user instead of dropping it (multi-account isolation #669).
+        assert_eq!(events[0].data["user_id"], "user-1");
 
         let payload: aionui_api_types::TeamSlotWorkChangedPayload =
             serde_json::from_value(events[0].data.clone()).unwrap();
@@ -438,6 +477,70 @@ mod tests {
         assert_eq!(payload.slot_work.slot_id, "lead-1");
         assert_eq!(payload.slot_work.state, aionui_api_types::TeamSlotWorkState::Idle);
         assert_eq!(payload.slot_work.active_turn_id, None);
+    }
+
+    #[test]
+    fn task_changed_event_has_correct_shape() {
+        let (emitter, bc) = make_emitter();
+        emitter.broadcast_task_changed(
+            TeamTaskResponse {
+                id: "tk1".into(),
+                team_id: "team-1".into(),
+                subject: "Build".into(),
+                description: None,
+                status: "pending".into(),
+                owner: None,
+                blocked_by: vec![],
+                blocks: vec![],
+                created_at: 1,
+                updated_at: 1,
+            },
+            TeamTaskChange::Created,
+        );
+
+        let events = bc.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "team.taskChanged");
+        // Must carry user_id so the event-bus → WebSocket bridge delivers it to
+        // the owning user instead of dropping it (multi-account isolation #669).
+        assert_eq!(events[0].data["user_id"], "user-1");
+
+        let payload: TeamTaskChangedPayload = serde_json::from_value(events[0].data.clone()).unwrap();
+        assert_eq!(payload.team_id, "team-1");
+        assert_eq!(payload.task.id, "tk1");
+        assert_eq!(payload.change, TeamTaskChange::Created);
+    }
+
+    #[test]
+    fn mailbox_changed_event_has_correct_shape() {
+        let (emitter, bc) = make_emitter();
+        emitter.broadcast_mailbox_changed(
+            TeamMailboxMessageResponse {
+                id: "m1".into(),
+                team_id: "team-1".into(),
+                from_agent_id: "a2".into(),
+                to_agent_id: "a1".into(),
+                msg_type: "message".into(),
+                content: "hi".into(),
+                summary: None,
+                files: vec![],
+                read: true,
+                created_at: 1,
+            },
+            TeamMailboxChange::Read,
+        );
+
+        let events = bc.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name, "team.mailboxChanged");
+        // Must carry user_id so the event-bus → WebSocket bridge delivers it to
+        // the owning user instead of dropping it (multi-account isolation #669).
+        assert_eq!(events[0].data["user_id"], "user-1");
+
+        let payload: TeamMailboxChangedPayload = serde_json::from_value(events[0].data.clone()).unwrap();
+        assert_eq!(payload.team_id, "team-1");
+        assert_eq!(payload.message.id, "m1");
+        assert_eq!(payload.change, TeamMailboxChange::Read);
     }
 
     #[test]

@@ -23,6 +23,7 @@ impl PreSendHook for SessionNewPreludeHook {
 
         let metadata = &ctx.params.metadata;
         let config = InjectionConfig {
+            user_id: &ctx.params.user_id,
             preset_context: ctx.params.preset_context.as_deref(),
             skills: &ctx.params.config.skills,
             native_skill_support: metadata
@@ -56,7 +57,7 @@ impl PreSendHook for ModelIdentityReminderHook {
             .and_then(|m| {
                 m.available_models
                     .iter()
-                    .find(|am| am.model_id.0.as_ref() == model.as_str())
+                    .find(|am| am.model_id.as_str() == model.as_str())
                     .map(|am| am.name.clone())
             })
             .unwrap_or_else(|| model.as_str().to_owned());

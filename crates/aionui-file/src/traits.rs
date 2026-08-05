@@ -5,7 +5,9 @@ use aionui_common::FileChangeOperation;
 
 use crate::error::FileError;
 
-use crate::types::{CompareResult, CopyResult, DirOrFile, FileMetadata, SnapshotInfo, WorkspaceFlatFile, ZipEntry};
+use aionui_api_types::ContentEncoding;
+
+use crate::types::{CompareResult, CopyResult, DirOrFile, FileMetadata, SnapshotInfo, WorkspaceFlatFile};
 
 /// Core file operations: directory browsing, file read/write, management,
 /// image processing, and ZIP packaging.
@@ -14,6 +16,24 @@ use crate::types::{CompareResult, CopyResult, DirOrFile, FileMetadata, SnapshotI
 /// `path_safety` module) before reaching this trait's implementations.
 #[async_trait::async_trait]
 pub trait IFileService: Send + Sync {
+    // -- Content endpoint (pre-resolved absolute paths) --
+    //
+    // The caller (preview content endpoint) has already resolved a `ChatFileRef`
+    // to an absolute path via `ProjectService::resolve_chat_file_ref` with the
+    // matching per-variant containment guard, so these operate on the trusted
+    // path directly and do NOT re-apply the `allowed_roots` sandbox.
+
+    /// Read a pre-resolved absolute path and encode it per `encoding`
+    /// (utf8 text / base64 / data URL). `NotFound` if the file is gone.
+    async fn read_resolved_content(&self, absolute_path: &Path, encoding: ContentEncoding)
+    -> Result<String, FileError>;
+
+    /// Write `data` to a pre-resolved absolute path (full overwrite).
+    async fn write_resolved_content(&self, absolute_path: &Path, data: &[u8]) -> Result<(), FileError>;
+
+    /// Metadata for a pre-resolved absolute path.
+    async fn resolved_metadata(&self, absolute_path: &Path) -> Result<FileMetadata, FileError>;
+
     // -- Directory browsing --
 
     /// List the immediate children of `dir`, returning a tree with one level
@@ -44,13 +64,23 @@ pub trait IFileService: Send + Sync {
     /// Files larger than 256 MB are rejected.
     async fn read_file(&self, path: &str, extra_root: Option<&Path>) -> Result<Option<String>, FileError>;
 
-    /// Read a file as raw bytes. Returns `None` if the file does not exist.
-    /// Files larger than 256 MB are rejected.
-    async fn read_file_buffer(&self, path: &str, extra_root: Option<&Path>) -> Result<Option<Vec<u8>>, FileError>;
-
     /// Write `data` to `path`. On success, emits a
     /// `fileStream.contentUpdate` event with `operation = write`.
     async fn write_file(&self, path: &str, data: &[u8], workspace: &str) -> Result<bool, FileError>;
+
+    /// User-scoped variant of [`write_file`](Self::write_file), used by
+    /// authenticated routes so WebSocket events are delivered only to the
+    /// initiating user.
+    async fn write_file_for_user(
+        &self,
+        user_id: &str,
+        path: &str,
+        data: &[u8],
+        workspace: &str,
+    ) -> Result<bool, FileError> {
+        let _ = user_id;
+        self.write_file(path, data, workspace).await
+    }
 
     // -- File management --
 
@@ -63,34 +93,11 @@ pub trait IFileService: Send + Sync {
         source_root: Option<&str>,
     ) -> Result<CopyResult, FileError>;
 
-    /// Remove a file or directory (recursively). On success, emits a
-    /// `fileStream.contentUpdate` event with `operation = delete`.
-    async fn remove_entry(&self, path: &str, workspace: &str) -> Result<(), FileError>;
-
-    /// Rename a file or directory. Returns the new absolute path.
-    async fn rename_entry(&self, path: &str, new_name: &str) -> Result<String, FileError>;
-
-    /// Rename a file or directory, allowing one request-scoped root in
-    /// addition to the service sandbox.
-    async fn rename_entry_with_extra_root(
-        &self,
-        path: &str,
-        new_name: &str,
-        extra_root: Option<&Path>,
-    ) -> Result<String, FileError> {
-        let _ = extra_root;
-        self.rename_entry(path, new_name).await
-    }
-
-    /// Create an empty temporary file and return its absolute path.
-    async fn create_temp_file(&self, file_name: &str) -> Result<String, FileError>;
-
     /// Write `data` to a temporary file and return its absolute path.
     ///
     /// When `conversation_id` is provided, the file is placed under a
     /// per-conversation sub-directory (`<tmp>/aionui/<conversation_id>/`);
-    /// otherwise the shared `<tmp>/aionui/` directory is used (same as
-    /// [`create_temp_file`](Self::create_temp_file)).
+    /// otherwise the shared `<tmp>/aionui/` directory is used.
     ///
     /// `file_name` must not contain path separators or traversal patterns.
     async fn create_upload_file(
@@ -109,36 +116,6 @@ pub trait IFileService: Send + Sync {
     /// Download a remote image and return a base64 Data URL.
     /// On failure, returns a placeholder SVG Data URL.
     async fn fetch_remote_image(&self, url: &str) -> String;
-
-    // -- ZIP --
-
-    /// Create a ZIP archive at `path` from `entries`.
-    /// If `request_id` is provided, the operation can be cancelled via
-    /// [`cancel_zip`](Self::cancel_zip).
-    async fn create_zip(
-        &self,
-        path: &str,
-        entries: Vec<ZipEntry>,
-        request_id: Option<String>,
-    ) -> Result<bool, FileError>;
-
-    /// Create a ZIP archive, allowing request-scoped roots for the output path
-    /// and disk source entries in addition to the service sandbox.
-    async fn create_zip_with_extra_roots(
-        &self,
-        path: &str,
-        entries: Vec<ZipEntry>,
-        request_id: Option<String>,
-        output_root: Option<&Path>,
-        source_root: Option<&Path>,
-    ) -> Result<bool, FileError> {
-        let _ = (output_root, source_root);
-        self.create_zip(path, entries, request_id).await
-    }
-
-    /// Cancel an in-progress ZIP operation by its `request_id`.
-    /// Returns `true` if a matching operation was found and cancelled.
-    async fn cancel_zip(&self, request_id: &str) -> bool;
 }
 
 /// File system watching: single-file changes and workspace Office file
@@ -149,19 +126,55 @@ pub trait IFileWatchService: Send + Sync {
     /// Emits `fileWatch.fileChanged` events on the broadcast channel.
     async fn start_watch(&self, file_path: &str) -> Result<(), FileError>;
 
+    /// Start watching a single file for one WebUI user.
+    async fn start_watch_for_user(&self, user_id: &str, file_path: &str) -> Result<(), FileError> {
+        let _ = user_id;
+        self.start_watch(file_path).await
+    }
+
     /// Stop watching a previously registered file.
     async fn stop_watch(&self, file_path: &str) -> Result<(), FileError>;
 
+    /// Stop watching a file for one WebUI user.
+    async fn stop_watch_for_user(&self, user_id: &str, file_path: &str) -> Result<(), FileError> {
+        let _ = user_id;
+        self.stop_watch(file_path).await
+    }
+
     /// Stop all active file watches.
     async fn stop_all_watches(&self) -> Result<(), FileError>;
+
+    /// Stop all active file watches for one WebUI user.
+    async fn stop_all_watches_for_user(&self, user_id: &str) -> Result<(), FileError> {
+        let _ = user_id;
+        self.stop_all_watches().await
+    }
 
     /// Start watching a workspace directory for new Office files
     /// (.pptx, .docx, .xlsx).
     /// Emits `workspaceOfficeWatch.fileAdded` events.
     async fn start_office_watch(&self, workspace: &str) -> Result<(), FileError>;
 
+    /// Start watching a workspace for one WebUI user.
+    async fn start_office_watch_for_user(&self, user_id: &str, workspace: &str) -> Result<(), FileError> {
+        let _ = user_id;
+        self.start_office_watch(workspace).await
+    }
+
     /// Stop watching a workspace directory for Office files.
     async fn stop_office_watch(&self, workspace: &str) -> Result<(), FileError>;
+
+    /// Stop watching a workspace for one WebUI user.
+    async fn stop_office_watch_for_user(&self, user_id: &str, workspace: &str) -> Result<(), FileError> {
+        let _ = user_id;
+        self.stop_office_watch(workspace).await
+    }
+
+    /// Stop all active Office workspace watches for one WebUI user.
+    async fn stop_all_office_watches_for_user(&self, user_id: &str) -> Result<(), FileError> {
+        let _ = user_id;
+        Ok(())
+    }
 }
 
 /// Git-based workspace snapshot system for tracking file changes.
@@ -231,3 +244,17 @@ pub type FileWatchServiceRef = Arc<dyn IFileWatchService>;
 
 /// Convenience alias for an Arc-wrapped snapshot service.
 pub type SnapshotServiceRef = Arc<dyn ISnapshotService>;
+
+/// Reveal an absolute filesystem path in the OS file manager (a "show item in
+/// folder" / "open enclosing folder" capability). Defined here as the narrow
+/// port the `/api/fs/reveal` route depends on; the composition layer supplies an
+/// adapter over the shell service, so this crate needs no shell dependency.
+#[async_trait::async_trait]
+pub trait IItemRevealer: Send + Sync {
+    /// Reveal `absolute_path` in the OS file manager. The path is the resolved,
+    /// contained absolute path from `resolve_reference` — never client input.
+    async fn reveal(&self, absolute_path: &str) -> Result<(), FileError>;
+}
+
+/// Convenience alias for an Arc-wrapped item revealer.
+pub type ItemRevealerRef = Arc<dyn IItemRevealer>;

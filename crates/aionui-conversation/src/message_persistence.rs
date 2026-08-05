@@ -9,6 +9,7 @@ use crate::service::ConversationService;
 impl ConversationService {
     pub(crate) async fn persist_send_failure_tip(
         &self,
+        user_id: &str,
         conversation_id: &str,
         err: &AgentSendError,
         top_level_code: Option<&'static str>,
@@ -52,9 +53,10 @@ impl ConversationService {
             status: Some("error".into()),
             hidden: false,
             created_at: now_ms(),
+            backend_turn_id: None,
         };
 
-        if let Err(store_err) = self.conversation_repo().insert_message(&row).await {
+        if let Err(store_err) = self.conversation_repo().insert_message(user_id, &row).await {
             warn!(
                 conversation_id,
                 error = %ErrorChain(&store_err),

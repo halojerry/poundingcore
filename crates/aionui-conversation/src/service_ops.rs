@@ -1,8 +1,8 @@
 //! Agent-session operations on ConversationService.
 //!
 //! These forward to the active AgentInstance (via `self.task(id)`) for
-//! mode/model/usage/slash-commands/side-question queries, plus workspace
-//! browsing that needs the conversations.extra.workspace field.
+//! mode/model/usage/slash-commands/config-options/side-question queries,
+//! plus workspace browsing that needs the conversations.extra.workspace field.
 //!
 //! Kept in a separate file from service.rs to avoid pushing that file
 //! over 2000 lines.
@@ -26,7 +26,8 @@ const MAX_DIR_DEPTH: usize = 10;
 impl ConversationService {
     // ── Mode ────────────────────────────────────────────────────────
 
-    pub async fn get_mode(&self, conversation_id: &str) -> Result<AgentModeResponse, ConversationError> {
+    pub async fn get_mode(&self, user_id: &str, conversation_id: &str) -> Result<AgentModeResponse, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
         self.task(conversation_id)?
             .get_mode()
             .await
@@ -35,6 +36,7 @@ impl ConversationService {
 
     pub async fn set_mode(
         &self,
+        user_id: &str,
         conversation_id: &str,
         req: SetModeRequest,
     ) -> Result<AgentModeResponse, ConversationError> {
@@ -43,14 +45,22 @@ impl ConversationService {
                 reason: "mode must not be empty".into(),
             });
         }
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
         let task = self.task(conversation_id)?;
-        task.set_mode(&req.mode).await.map_err(ConversationError::from)?;
+        // Route the mode switch through the unified config-options chokepoint:
+        // the ACP manager's `set_config_option_confirmed` (mode is a select
+        // option in the config-option catalog) and the direct-CLI session
+        // backend both implement it.
+        task.set_config_option("mode", &req.mode)
+            .await
+            .map_err(ConversationError::from)?;
         // Persist the mode change for recovery on restart. These are
         // independent writes; a partial failure is non-fatal — the
         // agent is already in the new mode and will re-sync on next
         // reconcile.
         if let Err(e) = self
             .persist_runtime_assistant_snapshot(
+                user_id,
                 conversation_id,
                 crate::service::AssistantRuntimePreferenceUpdate {
                     permission: Some(&req.mode),
@@ -63,6 +73,7 @@ impl ConversationService {
         }
         if let Err(e) = self
             .persist_runtime_assistant_preferences(
+                user_id,
                 conversation_id,
                 crate::service::AssistantRuntimePreferenceUpdate {
                     permission: Some(&req.mode),
@@ -78,30 +89,21 @@ impl ConversationService {
 
     // ── Model ───────────────────────────────────────────────────────
 
-    pub async fn get_model(&self, conversation_id: &str) -> Result<GetModelInfoResponse, ConversationError> {
-        // Check conversation existence first — non-existent conversations
-        // should return 404, not a default null model response.
-        if self
-            .conversation_repo()
-            .get(conversation_id)
+    pub async fn get_model(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<GetModelInfoResponse, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        self.task(conversation_id)?
+            .get_model()
             .await
-            .map_err(|e| ConversationError::internal(format!("Failed to check conversation existence: {e}")))?
-            .is_none()
-        {
-            return Err(ConversationError::NotFound {
-                id: conversation_id.to_owned(),
-            });
-        }
-
-        match self.task(conversation_id) {
-            Ok(task) => task.get_model().await.map_err(ConversationError::from),
-            Err(ConversationError::ActiveAgentNotFound { .. }) => Ok(GetModelInfoResponse { model_info: None }),
-            Err(e) => Err(e),
-        }
+            .map_err(ConversationError::from)
     }
 
     pub async fn set_model(
         &self,
+        user_id: &str,
         conversation_id: &str,
         req: SetModelRequest,
     ) -> Result<GetModelInfoResponse, ConversationError> {
@@ -110,45 +112,19 @@ impl ConversationService {
                 reason: "model_id must not be empty".into(),
             });
         }
-
-        // Check conversation existence first — non-existent conversations
-        // should return 404, not a default null model response.
-        if self
-            .conversation_repo()
-            .get(conversation_id)
-            .await
-            .map_err(|e| ConversationError::internal(format!("Failed to check conversation existence: {e}")))?
-            .is_none()
-        {
-            return Err(ConversationError::NotFound {
-                id: conversation_id.to_owned(),
-            });
-        }
-
-        let task = match self.task(conversation_id) {
-            Ok(task) => task,
-            Err(ConversationError::ActiveAgentNotFound { .. }) => {
-                return Ok(GetModelInfoResponse { model_info: None });
-            }
-            Err(err) => {
-                tracing::warn!(
-                    conversation_id,
-                    model_id = %req.model_id,
-                    error = %err,
-                    "Set model skipped because active agent task is unavailable"
-                );
-                return Err(err);
-            }
-        };
-        task.set_model_confirmed(&req.model_id)
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        let task = self.task(conversation_id)?;
+        // Same unified chokepoint as `set_mode`: model is a select option in
+        // the config-option catalog.
+        task.set_config_option("model", &req.model_id)
             .await
             .map_err(ConversationError::from)?;
         // Persist the model change for recovery on restart. These are
         // independent writes; a partial failure is non-fatal — the
-        // agent is already confirmed in the new model (set_model_confirmed
-        // is atomic).
+        // agent is already confirmed in the new model.
         if let Err(e) = self
             .persist_runtime_assistant_snapshot(
+                user_id,
                 conversation_id,
                 crate::service::AssistantRuntimePreferenceUpdate {
                     model: Some(&req.model_id),
@@ -161,6 +137,7 @@ impl ConversationService {
         }
         if let Err(e) = self
             .persist_runtime_assistant_preferences(
+                user_id,
                 conversation_id,
                 crate::service::AssistantRuntimePreferenceUpdate {
                     model: Some(&req.model_id),
@@ -178,22 +155,10 @@ impl ConversationService {
 
     pub async fn get_config_options(
         &self,
+        user_id: &str,
         conversation_id: &str,
     ) -> Result<GetConfigOptionsResponse, ConversationError> {
-        // Check conversation existence first — non-existent conversations
-        // should return 404, not an empty config options list.
-        if self
-            .conversation_repo()
-            .get(conversation_id)
-            .await
-            .map_err(|e| ConversationError::internal(format!("Failed to check conversation existence: {e}")))?
-            .is_none()
-        {
-            return Err(ConversationError::NotFound {
-                id: conversation_id.to_owned(),
-            });
-        }
-
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
         match self.task(conversation_id) {
             Ok(task) => task.get_config_options().await.map_err(ConversationError::from),
             Err(ConversationError::ActiveAgentNotFound { .. }) => {
@@ -205,6 +170,7 @@ impl ConversationService {
 
     pub async fn set_config_option(
         &self,
+        user_id: &str,
         conversation_id: &str,
         option_id: &str,
         req: SetConfigOptionRequest,
@@ -219,30 +185,11 @@ impl ConversationService {
                 reason: "value must not be empty".into(),
             });
         }
-
-        // Check conversation existence first — non-existent conversations
-        // should return 404, not a default ack response.
-        if self
-            .conversation_repo()
-            .get(conversation_id)
-            .await
-            .map_err(|e| ConversationError::internal(format!("Failed to check conversation existence: {e}")))?
-            .is_none()
-        {
-            return Err(ConversationError::NotFound {
-                id: conversation_id.to_owned(),
-            });
-        }
-
-        let task = match self.task(conversation_id) {
-            Ok(task) => task,
-            Err(ConversationError::ActiveAgentNotFound { .. }) => {
-                return Ok(SetConfigOptionResponse {
-                    confirmation: ConfigOptionConfirmation::CommandAck,
-                    config_options: None,
-                });
-            }
-            Err(err) => {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        let agent = self.task(conversation_id)?;
+        let response = match agent.set_config_option(option_id, &req.value).await {
+            Ok(response) => response,
+            Err(err @ AgentError::Acp(AcpError::NotConnected)) => {
                 warn!(
                     conversation_id,
                     option_id,
@@ -250,58 +197,9 @@ impl ConversationService {
                     error = %ErrorChain(&err),
                     "Set config option skipped because active agent task is unavailable"
                 );
-                return Err(err);
+                return Err(ConversationError::from(err));
             }
-        };
-        // Redirect model/mode switches to the dedicated endpoints that
-        // actually apply the change to the running agent. The upstream
-        // config-options infrastructure (config_option_catalog, ConfigSnapshot,
-        // resolve_set_path) is not fully backported yet, so set_config_option
-        // would hit a stub that returns Observed without doing anything.
-        let response = match option_id {
-            "model" => {
-                task.set_model_confirmed(&req.value)
-                    .await
-                    .map_err(ConversationError::from)?;
-                let config_options = task
-                    .get_config_options()
-                    .await
-                    .map(|r| r.config_options)
-                    .unwrap_or_default();
-                SetConfigOptionResponse {
-                    confirmation: ConfigOptionConfirmation::Observed,
-                    config_options: Some(config_options),
-                }
-            }
-            "mode" => {
-                task.set_mode(&req.value).await.map_err(ConversationError::from)?;
-                let config_options = task
-                    .get_config_options()
-                    .await
-                    .map(|r| r.config_options)
-                    .unwrap_or_default();
-                SetConfigOptionResponse {
-                    confirmation: ConfigOptionConfirmation::Observed,
-                    config_options: Some(config_options),
-                }
-            }
-            _ => match task.set_config_option(option_id, &req.value).await {
-                Ok(response) => response,
-                Err(err @ AgentError::Acp(AcpError::NotConnected)) => {
-                    warn!(
-                        conversation_id,
-                        option_id,
-                        reason = ?AgentKillReason::AgentErrorRecovery,
-                        error = %ErrorChain(&err),
-                        "ACP config option failed because protocol is disconnected; evicting task"
-                    );
-                    self.task_manager()
-                        .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
-                        .await;
-                    return Err(ConversationError::from(err));
-                }
-                Err(err) => return Err(ConversationError::from(err)),
-            },
+            Err(err) => return Err(ConversationError::from(err)),
         };
 
         // Mirror runtime model/mode/thought-level switches into the persisted assistant
@@ -337,7 +235,10 @@ impl ConversationService {
                 _ => None,
             };
             if let Some(updates) = updates {
-                if let Err(err) = self.persist_runtime_assistant_snapshot(conversation_id, updates).await {
+                if let Err(err) = self
+                    .persist_runtime_assistant_snapshot(user_id, conversation_id, updates)
+                    .await
+                {
                     warn!(
                         conversation_id,
                         option_id,
@@ -346,7 +247,7 @@ impl ConversationService {
                     );
                 }
                 if let Err(err) = self
-                    .persist_runtime_assistant_preferences(conversation_id, updates)
+                    .persist_runtime_assistant_preferences(user_id, conversation_id, updates)
                     .await
                 {
                     warn!(
@@ -364,28 +265,37 @@ impl ConversationService {
 
     // ── Usage / Slash commands ──────────────────────────────────────
 
-    pub async fn get_usage(&self, conversation_id: &str) -> Result<Option<serde_json::Value>, ConversationError> {
-        self.task(conversation_id)?
-            .get_usage()
+    pub async fn get_usage(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<serde_json::Value>, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        // A reaped task must NOT mean "no usage". The indicator's whole point is
+        // to survive switching away and back, and the snapshot it needs is
+        // already durable in `acp_session.session_config.runtime.context_usage`
+        // — `SessionAgentTask::get_usage` reads it from there too. Requiring a
+        // live task here made the figure vanish exactly when the user returned
+        // to an idle conversation.
+        if let Ok(task) = self.task(conversation_id) {
+            return task.get_usage().await.map_err(ConversationError::from);
+        }
+        let state = self
+            .acp_session_repo()
+            .load_runtime_state_for_user(user_id, conversation_id)
             .await
-            .map_err(ConversationError::from)
+            .map_err(|e| ConversationError::internal(format!("Failed to load usage state: {e}")))?;
+        Ok(state
+            .and_then(|s| s.context_usage_json)
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok()))
     }
 
-    pub async fn get_slash_commands(&self, conversation_id: &str) -> Result<Vec<SlashCommandItem>, ConversationError> {
-        // Check conversation existence first — non-existent conversations
-        // should return 404, not an empty commands list.
-        if self
-            .conversation_repo()
-            .get(conversation_id)
-            .await
-            .map_err(|e| ConversationError::internal(format!("Failed to check conversation existence: {e}")))?
-            .is_none()
-        {
-            return Err(ConversationError::NotFound {
-                id: conversation_id.to_owned(),
-            });
-        }
-
+    pub async fn get_slash_commands(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<SlashCommandItem>, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
         match self.task(conversation_id) {
             Ok(task) => task.get_slash_commands().await.map_err(ConversationError::from),
             Err(ConversationError::ActiveAgentNotFound { .. }) => Ok(Vec::new()),
@@ -397,15 +307,33 @@ impl ConversationService {
 
     pub async fn handle_side_question(
         &self,
+        user_id: &str,
         conversation_id: &str,
         req: SideQuestionRequest,
     ) -> Result<SideQuestionResponse, ConversationError> {
+        self.ensure_owned_conversation(user_id, conversation_id).await?;
         // `AgentInstance::handle_side_question` already validates that the
         // question is non-empty; no need to duplicate the check here.
         self.task(conversation_id)?
             .handle_side_question(req)
             .await
             .map_err(ConversationError::from)
+    }
+
+    async fn ensure_owned_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), ConversationError> {
+        let exists = self
+            .conversation_repo()
+            .get(user_id, conversation_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load conversation: {e}")))?
+            .is_some();
+        if exists {
+            Ok(())
+        } else {
+            Err(ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })
+        }
     }
 
     // ── Workspace browsing ──────────────────────────────────────────
@@ -416,6 +344,7 @@ impl ConversationService {
     /// depth cap of [`MAX_DIR_DEPTH`].
     pub async fn browse_workspace(
         &self,
+        user_id: &str,
         conversation_id: &str,
         query: WorkspaceBrowseQuery,
     ) -> Result<Vec<WorkspaceEntry>, ConversationError> {
@@ -427,7 +356,7 @@ impl ConversationService {
 
         let row = self
             .conversation_repo()
-            .get(conversation_id)
+            .get(user_id, conversation_id)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to load conversation: {e}")))?
             .ok_or_else(|| ConversationError::NotFound {

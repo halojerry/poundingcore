@@ -4,8 +4,10 @@
 pub mod active_lease;
 pub(crate) mod agent_runtime;
 pub mod agent_task;
+pub mod antigravity_hook;
 pub mod capability;
 pub mod cc_switch;
+mod claude_flags;
 pub(crate) mod cli_probe;
 pub(crate) mod dev_prompt_dump;
 pub mod error;
@@ -17,6 +19,7 @@ pub mod manager;
 /// conversation's configured MCP servers into the SDK-free `SessionMcpServer`
 /// shape the `SessionBackend` stack carries in `SessionConfig.init.mcp_servers`.
 pub(crate) mod mcp_resolve;
+pub mod media;
 pub(crate) mod persistence;
 pub mod protocol;
 pub mod registry;
@@ -29,6 +32,7 @@ pub mod session_context;
 pub mod shared_kernel;
 pub mod task_manager;
 pub mod types;
+mod workflow_progress;
 
 pub use active_lease::{ACTIVE_LEASE_TTL_MS, ActiveLeaseRegistry};
 pub use agent_runtime::AgentRuntime;
@@ -46,6 +50,7 @@ pub use factory::{AgentFactoryDeps, build_agent_factory};
 pub use idle_scanner::{
     IdleCleanupCoordinator, resolve_idle_config_from_env, start_idle_scanner, start_idle_scanner_with_coordinator,
 };
+pub use manager::acp::RequiredFullAutoApplication;
 pub use persistence::AcpSessionSyncService;
 pub use protocol::error::AcpError;
 pub use protocol::events::AgentStreamEvent;

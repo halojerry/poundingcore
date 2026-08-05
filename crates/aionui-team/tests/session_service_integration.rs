@@ -13,7 +13,7 @@ use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, IWorkerTaskManager, WorkerTaskManagerImpl};
 use aionui_api_types::{
     AcpBuildExtra, AcpConfigOptionDto, AcpConfigSelectOptionDto, AddAgentRequest, CreateTeamRequest,
-    GetConfigOptionsResponse, TeamAgentInput, WebSocketMessage,
+    GetConfigOptionsResponse, TeamAgentInput, TeamRunSource, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, AgentType, PaginatedResult, ProviderWithModel};
 use aionui_db::models::{
@@ -22,9 +22,10 @@ use aionui_db::models::{
     UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
 };
 use aionui_db::{
-    ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository, IAssistantDefinitionRepository,
-    IAssistantOverlayRepository, IConversationRepository, IProviderRepository, ITeamRepository, MessagePageParams,
-    MessagePageResult, MessageRowUpdate, MessageSearchRow, resolve_agent_binding_from_rows,
+    ActivityCursor, ConversationFilters, ConversationRowUpdate, DbError, IAgentMetadataRepository,
+    IAssistantDefinitionRepository, IAssistantOverlayRepository, IConversationRepository, IProviderRepository,
+    ITeamRepository, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, PageDirection,
+    resolve_agent_binding_from_rows,
 };
 use aionui_realtime::EventBroadcaster;
 
@@ -99,19 +100,23 @@ impl MockConversationRepo {
 
 #[async_trait::async_trait]
 impl IConversationRepository for MockConversationRepo {
-    async fn get(&self, id: &str) -> Result<Option<ConversationRow>, DbError> {
+    async fn get(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, DbError> {
         let convs = self.conversations.lock().unwrap();
-        Ok(convs.iter().find(|c| c.id == id).cloned())
+        Ok(convs.iter().find(|c| c.user_id == user_id && c.id == id).cloned())
+    }
+    async fn owner_user_id(&self, id: &str) -> Result<Option<String>, DbError> {
+        let convs = self.conversations.lock().unwrap();
+        Ok(convs.iter().find(|c| c.id == id).map(|c| c.user_id.clone()))
     }
     async fn create(&self, row: &ConversationRow) -> Result<(), DbError> {
         self.conversations.lock().unwrap().push(row.clone());
         Ok(())
     }
-    async fn update(&self, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError> {
+    async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError> {
         let mut convs = self.conversations.lock().unwrap();
         let conv = convs
             .iter_mut()
-            .find(|c| c.id == id)
+            .find(|c| c.user_id == user_id && c.id == id)
             .ok_or_else(|| DbError::NotFound(id.to_owned()))?;
         if let Some(ref extra) = updates.extra {
             conv.extra = extra.clone();
@@ -130,8 +135,11 @@ impl IConversationRepository for MockConversationRepo {
         }
         Ok(())
     }
-    async fn delete(&self, id: &str) -> Result<(), DbError> {
-        self.conversations.lock().unwrap().retain(|c| c.id != id);
+    async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        self.conversations
+            .lock()
+            .unwrap()
+            .retain(|c| c.user_id != user_id || c.id != id);
         Ok(())
     }
     async fn list_paginated(
@@ -162,6 +170,7 @@ impl IConversationRepository for MockConversationRepo {
     }
     async fn list_messages_page(
         &self,
+        _user_id: &str,
         _conv_id: &str,
         _params: &MessagePageParams,
     ) -> Result<MessagePageResult, DbError> {
@@ -171,18 +180,25 @@ impl IConversationRepository for MockConversationRepo {
             has_more_after: false,
         })
     }
-    async fn insert_message(&self, message: &MessageRow) -> Result<(), DbError> {
+    async fn insert_message(&self, _user_id: &str, message: &MessageRow) -> Result<(), DbError> {
         self.messages.lock().unwrap().push(message.clone());
         Ok(())
     }
-    async fn update_message(&self, _id: &str, _updates: &MessageRowUpdate) -> Result<(), DbError> {
+    async fn update_message(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _id: &str,
+        _updates: &MessageRowUpdate,
+    ) -> Result<(), DbError> {
         Ok(())
     }
-    async fn delete_messages_by_conversation(&self, _conv_id: &str) -> Result<(), DbError> {
+    async fn delete_messages_by_conversation(&self, _user_id: &str, _conv_id: &str) -> Result<(), DbError> {
         Ok(())
     }
     async fn get_message_by_msg_id(
         &self,
+        _user_id: &str,
         conv_id: &str,
         msg_id: &str,
         msg_type: &str,
@@ -397,6 +413,9 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 status: Some("pending".into()),
                 created_at: now,
                 updated_at: now,
+                project_id: None,
+                folder_id: None,
+                name_source: None,
             })
             .await?;
         Ok(TeamConversationCreateResult {
@@ -426,7 +445,11 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         }))
     }
 
-    async fn create_team_temp_workspace(&self, team_id: &str) -> Result<String, aionui_team::TeamError> {
+    async fn create_team_temp_workspace(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+    ) -> Result<String, aionui_team::TeamError> {
         if self
             .fail_team_temp_create
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -466,8 +489,14 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                 target.insert(key.clone(), value.clone());
             }
         }
+        let user_id = self
+            .repo
+            .owner_user_id(conversation_id)
+            .await?
+            .ok_or_else(|| aionui_team::TeamError::AgentNotFound(conversation_id.to_owned()))?;
         self.repo
             .update(
+                &user_id,
                 conversation_id,
                 &ConversationRowUpdate {
                     name: None,
@@ -477,6 +506,9 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
                     extra: Some(serde_json::to_string(&extra).unwrap()),
                     status: None,
                     updated_at: Some(aionui_common::now_ms()),
+                    project_id: None,
+                    folder_id: None,
+                    name_source: None,
                 },
             )
             .await?;
@@ -526,14 +558,9 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         conversation_id: &str,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), aionui_team::TeamError> {
-        let row = self
-            .repo
-            .get(conversation_id)
-            .await?
-            .filter(|row| row.user_id == user_id)
-            .ok_or_else(|| {
-                aionui_team::TeamError::InvalidRequest(format!("conversation not found: {conversation_id}"))
-            })?;
+        let row = self.repo.get(user_id, conversation_id).await?.ok_or_else(|| {
+            aionui_team::TeamError::InvalidRequest(format!("conversation not found: {conversation_id}"))
+        })?;
         let extra: serde_json::Value = serde_json::from_str(&row.extra)?;
         let team = aionui_api_types::TeamSessionBinding::from_extra_value(&extra)?;
         let config: AcpBuildExtra = serde_json::from_value(extra.clone()).unwrap_or_default();
@@ -594,7 +621,7 @@ impl TeamConversationProvisioningPort for FakeConversationPorts {
         _user_id: &str,
         conversation_id: &str,
     ) -> Result<(), aionui_team::TeamError> {
-        self.repo.delete(conversation_id).await?;
+        self.repo.delete(_user_id, conversation_id).await?;
         Ok(())
     }
 }
@@ -611,14 +638,22 @@ impl TeamProjectionMessageStore for FakeConversationPorts {
         msg_id: &str,
         msg_type: &str,
     ) -> Result<Option<MessageRow>, aionui_team::TeamError> {
+        let Some(user_id) = self.repo.owner_user_id(conversation_id).await? else {
+            return Ok(None);
+        };
         Ok(self
             .repo
-            .get_message_by_msg_id(conversation_id, msg_id, msg_type)
+            .get_message_by_msg_id(&user_id, conversation_id, msg_id, msg_type)
             .await?)
     }
 
     async fn insert_projected_message(&self, row: &MessageRow) -> Result<(), aionui_team::TeamError> {
-        self.repo.insert_message(row).await?;
+        let user_id = self
+            .repo
+            .owner_user_id(&row.conversation_id)
+            .await?
+            .ok_or_else(|| aionui_team::TeamError::InvalidRequest("conversation not found".into()))?;
+        self.repo.insert_message(&user_id, row).await?;
         Ok(())
     }
 }
@@ -629,7 +664,10 @@ impl TeamConversationLookupPort for FakeConversationPorts {
         &self,
         conversation_id: &str,
     ) -> Result<Option<TeamConversationBindingLookup>, aionui_team::TeamError> {
-        let Some(row) = self.repo.get(conversation_id).await? else {
+        let Some(user_id) = self.repo.owner_user_id(conversation_id).await? else {
+            return Ok(None);
+        };
+        let Some(row) = self.repo.get(&user_id, conversation_id).await? else {
             return Ok(None);
         };
         let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
@@ -722,7 +760,7 @@ impl ITeamRepository for FullMockTeamRepo {
         self.teams.lock().unwrap().push(row.clone());
         Ok(())
     }
-    async fn list_teams(&self) -> Result<Vec<aionui_db::models::TeamRow>, DbError> {
+    async fn list_teams_for_restore(&self) -> Result<Vec<aionui_db::models::TeamRow>, DbError> {
         Ok(self.teams.lock().unwrap().clone())
     }
     async fn list_teams_by_user(&self, user_id: &str) -> Result<Vec<aionui_db::models::TeamRow>, DbError> {
@@ -735,10 +773,19 @@ impl ITeamRepository for FullMockTeamRepo {
             .cloned()
             .collect())
     }
-    async fn get_team(&self, id: &str) -> Result<Option<aionui_db::models::TeamRow>, DbError> {
+    async fn get_team(&self, user_id: &str, id: &str) -> Result<Option<aionui_db::models::TeamRow>, DbError> {
+        Ok(self
+            .teams
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.user_id == user_id && t.id == id)
+            .cloned())
+    }
+    async fn get_team_for_restore(&self, id: &str) -> Result<Option<aionui_db::models::TeamRow>, DbError> {
         Ok(self.teams.lock().unwrap().iter().find(|t| t.id == id).cloned())
     }
-    async fn update_team(&self, id: &str, params: &aionui_db::UpdateTeamParams) -> Result<(), DbError> {
+    async fn update_team(&self, user_id: &str, id: &str, params: &aionui_db::UpdateTeamParams) -> Result<(), DbError> {
         if params.workspace.is_some() && *self.fail_workspace_update.lock().unwrap() {
             return Err(DbError::Init("forced workspace writeback failure".into()));
         }
@@ -748,7 +795,7 @@ impl ITeamRepository for FullMockTeamRepo {
         let mut teams = self.teams.lock().unwrap();
         let team = teams
             .iter_mut()
-            .find(|t| t.id == id)
+            .find(|t| t.user_id == user_id && t.id == id)
             .ok_or_else(|| DbError::NotFound(id.to_owned()))?;
         if let Some(ref name) = params.name {
             team.name = name.clone();
@@ -765,70 +812,140 @@ impl ITeamRepository for FullMockTeamRepo {
         team.updated_at = aionui_common::now_ms();
         Ok(())
     }
-    async fn delete_team(&self, id: &str) -> Result<(), DbError> {
-        self.teams.lock().unwrap().retain(|t| t.id != id);
+    async fn delete_team(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        self.teams
+            .lock()
+            .unwrap()
+            .retain(|t| t.user_id != user_id || t.id != id);
         Ok(())
     }
 
-    async fn write_message(&self, row: &aionui_db::models::MailboxMessageRow) -> Result<(), DbError> {
+    async fn write_message(&self, user_id: &str, row: &aionui_db::models::MailboxMessageRow) -> Result<(), DbError> {
         if *self.fail_message_writes.lock().unwrap() {
             return Err(DbError::Init("forced mailbox write failure".into()));
         }
-        self.inner.write_message(row).await
+        self.inner.write_message(user_id, row).await
     }
     async fn read_unread_and_mark(
         &self,
+        user_id: &str,
         team_id: &str,
         to_agent_id: &str,
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-        self.inner.read_unread_and_mark(team_id, to_agent_id).await
+        self.inner.read_unread_and_mark(user_id, team_id, to_agent_id).await
     }
     async fn peek_unread(
         &self,
+        user_id: &str,
         team_id: &str,
         to_agent_id: &str,
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-        self.inner.peek_unread(team_id, to_agent_id).await
+        self.inner.peek_unread(user_id, team_id, to_agent_id).await
     }
-    async fn mark_read_batch(&self, ids: &[String]) -> Result<(), DbError> {
-        self.inner.mark_read_batch(ids).await
+    async fn mark_read_batch(&self, user_id: &str, team_id: &str, ids: &[String]) -> Result<(), DbError> {
+        self.inner.mark_read_batch(user_id, team_id, ids).await
     }
     async fn get_history(
         &self,
+        user_id: &str,
         team_id: &str,
         to_agent_id: &str,
         limit: Option<i64>,
     ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
-        self.inner.get_history(team_id, to_agent_id, limit).await
+        self.inner.get_history(user_id, team_id, to_agent_id, limit).await
     }
-    async fn delete_mailbox_by_team(&self, team_id: &str) -> Result<(), DbError> {
-        self.inner.delete_mailbox_by_team(team_id).await
+    async fn list_messages_by_team(
+        &self,
+        team_id: &str,
+        limit: i64,
+    ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+        self.inner.list_messages_by_team(team_id, limit).await
+    }
+    async fn list_messages_by_team_paged(
+        &self,
+        team_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        limit: i64,
+    ) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+        self.inner
+            .list_messages_by_team_paged(team_id, cursor, direction, limit)
+            .await
+    }
+    async fn list_messages_by_ids(&self, ids: &[String]) -> Result<Vec<aionui_db::models::MailboxMessageRow>, DbError> {
+        self.inner.list_messages_by_ids(ids).await
+    }
+    async fn delete_mailbox_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError> {
+        self.inner.delete_mailbox_by_team(user_id, team_id).await
     }
 
-    async fn create_task(&self, row: &aionui_db::models::TeamTaskRow) -> Result<(), DbError> {
-        self.inner.create_task(row).await
+    async fn create_task(&self, user_id: &str, row: &aionui_db::models::TeamTaskRow) -> Result<(), DbError> {
+        self.inner.create_task(user_id, row).await
     }
     async fn find_task_by_id(
         &self,
+        user_id: &str,
         team_id: &str,
         task_id: &str,
     ) -> Result<Option<aionui_db::models::TeamTaskRow>, DbError> {
-        self.inner.find_task_by_id(team_id, task_id).await
+        self.inner.find_task_by_id(user_id, team_id, task_id).await
     }
-    async fn update_task(&self, task_id: &str, params: &aionui_db::UpdateTaskParams) -> Result<(), DbError> {
-        self.inner.update_task(task_id, params).await
+    async fn update_task(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        task_id: &str,
+        params: &aionui_db::UpdateTaskParams,
+    ) -> Result<(), DbError> {
+        self.inner.update_task(user_id, team_id, task_id, params).await
     }
-    async fn list_tasks(&self, team_id: &str) -> Result<Vec<aionui_db::models::TeamTaskRow>, DbError> {
-        self.inner.list_tasks(team_id).await
+    async fn list_tasks(&self, user_id: &str, team_id: &str) -> Result<Vec<aionui_db::models::TeamTaskRow>, DbError> {
+        self.inner.list_tasks(user_id, team_id).await
     }
-    async fn append_to_blocks(&self, task_id: &str, blocked_task_id: &str) -> Result<(), DbError> {
-        self.inner.append_to_blocks(task_id, blocked_task_id).await
+    async fn list_tasks_by_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<aionui_db::models::TeamTaskRow>, DbError> {
+        self.inner.list_tasks_by_ids(user_id, team_id, ids).await
     }
-    async fn remove_from_blocked_by(&self, task_id: &str, unblocked_task_id: &str) -> Result<(), DbError> {
-        self.inner.remove_from_blocked_by(task_id, unblocked_task_id).await
+    async fn list_tasks_paged(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        limit: i64,
+    ) -> Result<Vec<aionui_db::models::TeamTaskRow>, DbError> {
+        self.inner
+            .list_tasks_paged(user_id, team_id, cursor, direction, limit)
+            .await
     }
-    async fn delete_tasks_by_team(&self, team_id: &str) -> Result<(), DbError> {
-        self.inner.delete_tasks_by_team(team_id).await
+    async fn append_to_blocks(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        task_id: &str,
+        blocked_task_id: &str,
+    ) -> Result<(), DbError> {
+        self.inner
+            .append_to_blocks(user_id, team_id, task_id, blocked_task_id)
+            .await
+    }
+    async fn remove_from_blocked_by(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        task_id: &str,
+        unblocked_task_id: &str,
+    ) -> Result<(), DbError> {
+        self.inner
+            .remove_from_blocked_by(user_id, team_id, task_id, unblocked_task_id)
+            .await
+    }
+    async fn delete_tasks_by_team(&self, user_id: &str, team_id: &str) -> Result<(), DbError> {
+        self.inner.delete_tasks_by_team(user_id, team_id).await
     }
 }
 
@@ -866,8 +983,14 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError> {
         Ok(self.rows_by_id.values().cloned().collect())
     }
+    async fn list_all_for_user(&self, _user_id: &str) -> Result<Vec<AgentMetadataRow>, DbError> {
+        self.list_all().await
+    }
     async fn get(&self, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(self.rows_by_id.get(id).cloned())
+    }
+    async fn get_for_user(&self, _user_id: &str, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.get(id).await
     }
     async fn find_by_source_and_name(
         &self,
@@ -880,11 +1003,33 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
             .find(|row| row.agent_source == agent_source && row.name == name)
             .cloned())
     }
+    async fn find_by_source_and_name_for_user(
+        &self,
+        _user_id: &str,
+        agent_source: &str,
+        name: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.find_by_source_and_name(agent_source, name).await
+    }
     async fn find_builtin_by_backend(&self, backend: &str) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(self.builtin_by_backend.get(backend).cloned())
     }
+    async fn find_builtin_by_backend_for_user(
+        &self,
+        _user_id: &str,
+        backend: &str,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.find_builtin_by_backend(backend).await
+    }
     async fn upsert(&self, _params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError> {
         Err(DbError::Init("stub".into()))
+    }
+    async fn upsert_for_user(
+        &self,
+        _user_id: &str,
+        params: &UpsertAgentMetadataParams<'_>,
+    ) -> Result<AgentMetadataRow, DbError> {
+        self.upsert(params).await
     }
     async fn apply_handshake(
         &self,
@@ -893,12 +1038,28 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
     }
+    async fn apply_handshake_for_user(
+        &self,
+        _user_id: &str,
+        id: &str,
+        params: &UpdateAgentHandshakeParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.apply_handshake(id, params).await
+    }
     async fn update_availability_snapshot(
         &self,
         _id: &str,
         _params: &UpdateAgentAvailabilitySnapshotParams<'_>,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Ok(None)
+    }
+    async fn update_availability_snapshot_for_user(
+        &self,
+        _user_id: &str,
+        id: &str,
+        params: &UpdateAgentAvailabilitySnapshotParams<'_>,
+    ) -> Result<Option<AgentMetadataRow>, DbError> {
+        self.update_availability_snapshot(id, params).await
     }
     async fn update_agent_overrides(
         &self,
@@ -908,11 +1069,26 @@ impl IAgentMetadataRepository for StubAgentMetadataRepo {
     ) -> Result<(), DbError> {
         Ok(())
     }
+    async fn update_agent_overrides_for_user(
+        &self,
+        _user_id: &str,
+        id: &str,
+        command_override: Option<&str>,
+        env_override: Option<&str>,
+    ) -> Result<(), DbError> {
+        self.update_agent_overrides(id, command_override, env_override).await
+    }
     async fn set_enabled(&self, _id: &str, _enabled: bool) -> Result<bool, DbError> {
         Ok(false)
     }
+    async fn set_enabled_for_user(&self, _user_id: &str, id: &str, enabled: bool) -> Result<bool, DbError> {
+        self.set_enabled(id, enabled).await
+    }
     async fn delete(&self, _id: &str) -> Result<bool, DbError> {
         Ok(false)
+    }
+    async fn delete_for_user(&self, _user_id: &str, id: &str) -> Result<bool, DbError> {
+        self.delete(id).await
     }
 }
 
@@ -1251,7 +1427,10 @@ struct EmptyTeamAssistantCatalog;
 
 #[async_trait::async_trait]
 impl TeamAssistantCatalogPort for EmptyTeamAssistantCatalog {
-    async fn list_team_selectable_assistants(&self) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError> {
+    async fn list_team_selectable_assistants(
+        &self,
+        _user_id: &str,
+    ) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError> {
         Ok(Vec::new())
     }
 }
@@ -1264,13 +1443,19 @@ struct TestTeamAssistantCatalog {
 
 #[async_trait::async_trait]
 impl TeamAssistantCatalogPort for TestTeamAssistantCatalog {
-    async fn list_team_selectable_assistants(&self) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError> {
-        let agent_rows = self.agent_metadata_repo.list_all().await?;
-        let definitions = self.assistant_definition_repo.list().await?;
+    async fn list_team_selectable_assistants(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<TeamAssistantCatalogEntry>, TeamError> {
+        let agent_rows = self.agent_metadata_repo.list_all_for_user(user_id).await?;
+        let definitions = self.assistant_definition_repo.list_for_user(user_id).await?;
         let mut result = Vec::new();
 
         for definition in definitions {
-            let overlay = self.assistant_overlay_repo.get(&definition.id).await?;
+            let overlay = self
+                .assistant_overlay_repo
+                .get_for_user(user_id, &definition.id)
+                .await?;
             if overlay.as_ref().is_some_and(|row| !row.enabled) {
                 continue;
             }
@@ -1299,10 +1484,10 @@ struct EmptyProviderRepo;
 
 #[async_trait::async_trait]
 impl IProviderRepository for EmptyProviderRepo {
-    async fn list(&self) -> Result<Vec<aionui_db::models::Provider>, DbError> {
+    async fn list(&self, _user_id: &str) -> Result<Vec<aionui_db::models::Provider>, DbError> {
         Ok(vec![])
     }
-    async fn find_by_id(&self, _id: &str) -> Result<Option<aionui_db::models::Provider>, DbError> {
+    async fn find_by_id(&self, _user_id: &str, _id: &str) -> Result<Option<aionui_db::models::Provider>, DbError> {
         Ok(None)
     }
     async fn create(
@@ -1313,12 +1498,13 @@ impl IProviderRepository for EmptyProviderRepo {
     }
     async fn update(
         &self,
+        _user_id: &str,
         _id: &str,
         _params: aionui_db::UpdateProviderParams<'_>,
     ) -> Result<aionui_db::models::Provider, DbError> {
         Err(DbError::NotFound("not implemented".into()))
     }
-    async fn delete(&self, _id: &str) -> Result<(), DbError> {
+    async fn delete(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
         Err(DbError::NotFound("not implemented".into()))
     }
 }
@@ -1331,12 +1517,44 @@ impl IAssistantDefinitionRepository for EmptyAssistantDefinitionRepo {
         Ok(vec![])
     }
 
+    async fn list_for_user(&self, _user_id: &str) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        self.list().await
+    }
+
+    async fn list_including_deleted_for_user(&self, _user_id: &str) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        self.list().await
+    }
+
     async fn get_by_assistant_id(&self, _assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
         Ok(None)
     }
 
+    async fn get_by_assistant_id_for_user(
+        &self,
+        _user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_assistant_id(assistant_id).await
+    }
+
+    async fn get_by_assistant_id_including_deleted_for_user(
+        &self,
+        _user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_assistant_id(assistant_id).await
+    }
+
     async fn get_by_id(&self, _definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
         Ok(None)
+    }
+
+    async fn get_by_id_for_user(
+        &self,
+        _user_id: &str,
+        definition_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_id(definition_id).await
     }
 
     async fn get_by_source_ref(
@@ -1347,12 +1565,47 @@ impl IAssistantDefinitionRepository for EmptyAssistantDefinitionRepo {
         Ok(None)
     }
 
+    async fn get_by_source_ref_for_user(
+        &self,
+        _user_id: &str,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_source_ref(source, source_ref).await
+    }
+
+    async fn get_by_source_ref_including_deleted_for_user(
+        &self,
+        _user_id: &str,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_source_ref(source, source_ref).await
+    }
+
     async fn upsert(&self, _params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError> {
         Err(DbError::Init("not implemented".into()))
     }
 
+    async fn upsert_for_user(
+        &self,
+        _user_id: &str,
+        params: &UpsertAssistantDefinitionParams<'_>,
+    ) -> Result<AssistantDefinitionRow, DbError> {
+        self.upsert(params).await
+    }
+
     async fn soft_delete(&self, _definition_id: &str, _deleted_at: i64) -> Result<bool, DbError> {
         Ok(false)
+    }
+
+    async fn soft_delete_for_user(
+        &self,
+        _user_id: &str,
+        definition_id: &str,
+        deleted_at: i64,
+    ) -> Result<bool, DbError> {
+        self.soft_delete(definition_id, deleted_at).await
     }
 }
 
@@ -1364,16 +1617,36 @@ impl IAssistantOverlayRepository for EmptyAssistantOverlayRepo {
         Ok(None)
     }
 
+    async fn get_for_user(&self, _user_id: &str, definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
+        self.get(definition_id).await
+    }
+
     async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
         Ok(vec![])
+    }
+
+    async fn list_for_user(&self, _user_id: &str) -> Result<Vec<AssistantOverlayRow>, DbError> {
+        self.list().await
     }
 
     async fn upsert(&self, _params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
         Err(DbError::Init("not implemented".into()))
     }
 
+    async fn upsert_for_user(
+        &self,
+        _user_id: &str,
+        params: &UpsertAssistantOverlayParams<'_>,
+    ) -> Result<AssistantOverlayRow, DbError> {
+        self.upsert(params).await
+    }
+
     async fn delete(&self, _definition_id: &str) -> Result<bool, DbError> {
         Ok(false)
+    }
+
+    async fn delete_for_user(&self, _user_id: &str, definition_id: &str) -> Result<bool, DbError> {
+        self.delete(definition_id).await
     }
 }
 
@@ -1387,12 +1660,44 @@ impl IAssistantDefinitionRepository for SingleAssistantDefinitionRepo {
         Ok(vec![self.row.clone()])
     }
 
+    async fn list_for_user(&self, _user_id: &str) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        self.list().await
+    }
+
+    async fn list_including_deleted_for_user(&self, _user_id: &str) -> Result<Vec<AssistantDefinitionRow>, DbError> {
+        self.list().await
+    }
+
     async fn get_by_assistant_id(&self, assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
         Ok((self.row.assistant_id == assistant_id).then_some(self.row.clone()))
     }
 
+    async fn get_by_assistant_id_for_user(
+        &self,
+        _user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_assistant_id(assistant_id).await
+    }
+
+    async fn get_by_assistant_id_including_deleted_for_user(
+        &self,
+        _user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_assistant_id(assistant_id).await
+    }
+
     async fn get_by_id(&self, definition_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError> {
         Ok((self.row.id == definition_id).then_some(self.row.clone()))
+    }
+
+    async fn get_by_id_for_user(
+        &self,
+        _user_id: &str,
+        definition_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_id(definition_id).await
     }
 
     async fn get_by_source_ref(
@@ -1403,12 +1708,47 @@ impl IAssistantDefinitionRepository for SingleAssistantDefinitionRepo {
         Ok(None)
     }
 
+    async fn get_by_source_ref_for_user(
+        &self,
+        _user_id: &str,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_source_ref(source, source_ref).await
+    }
+
+    async fn get_by_source_ref_including_deleted_for_user(
+        &self,
+        _user_id: &str,
+        source: &str,
+        source_ref: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        self.get_by_source_ref(source, source_ref).await
+    }
+
     async fn upsert(&self, _params: &UpsertAssistantDefinitionParams<'_>) -> Result<AssistantDefinitionRow, DbError> {
         Err(DbError::Init("not implemented".into()))
     }
 
+    async fn upsert_for_user(
+        &self,
+        _user_id: &str,
+        params: &UpsertAssistantDefinitionParams<'_>,
+    ) -> Result<AssistantDefinitionRow, DbError> {
+        self.upsert(params).await
+    }
+
     async fn soft_delete(&self, _definition_id: &str, _deleted_at: i64) -> Result<bool, DbError> {
         Ok(false)
+    }
+
+    async fn soft_delete_for_user(
+        &self,
+        _user_id: &str,
+        definition_id: &str,
+        deleted_at: i64,
+    ) -> Result<bool, DbError> {
+        self.soft_delete(definition_id, deleted_at).await
     }
 }
 
@@ -1422,16 +1762,36 @@ impl IAssistantOverlayRepository for SingleAssistantOverlayRepo {
         Ok((self.row.assistant_definition_id == definition_id).then_some(self.row.clone()))
     }
 
+    async fn get_for_user(&self, _user_id: &str, definition_id: &str) -> Result<Option<AssistantOverlayRow>, DbError> {
+        self.get(definition_id).await
+    }
+
     async fn list(&self) -> Result<Vec<AssistantOverlayRow>, DbError> {
         Ok(vec![self.row.clone()])
+    }
+
+    async fn list_for_user(&self, _user_id: &str) -> Result<Vec<AssistantOverlayRow>, DbError> {
+        self.list().await
     }
 
     async fn upsert(&self, _params: &UpsertAssistantOverlayParams<'_>) -> Result<AssistantOverlayRow, DbError> {
         Err(DbError::Init("not implemented".into()))
     }
 
+    async fn upsert_for_user(
+        &self,
+        _user_id: &str,
+        params: &UpsertAssistantOverlayParams<'_>,
+    ) -> Result<AssistantOverlayRow, DbError> {
+        self.upsert(params).await
+    }
+
     async fn delete(&self, _definition_id: &str) -> Result<bool, DbError> {
         Ok(false)
+    }
+
+    async fn delete_for_user(&self, _user_id: &str, definition_id: &str) -> Result<bool, DbError> {
+        self.delete(definition_id).await
     }
 }
 
@@ -1644,7 +2004,7 @@ fn setup() -> Arc<TeamSessionService> {
 }
 
 #[tokio::test]
-async fn recovery_creates_background_intents_without_restoring_old_memory_run() {
+async fn recovery_creates_system_run_intents_without_restoring_old_memory_run() {
     let (svc, team_repo, turn_port, _conv_repo) = setup_with_recording_turn_port();
     let created = svc
         .create_team(
@@ -1663,18 +2023,21 @@ async fn recovery_creates_background_intents_without_restoring_old_memory_run() 
         .expect("clear existing session");
 
     team_repo
-        .write_message(&aionui_db::models::MailboxMessageRow {
-            id: "mailbox-orphan-1".into(),
-            team_id: created.id.clone(),
-            to_agent_id: lead_slot_id.clone(),
-            from_agent_id: "worker-or-user".into(),
-            msg_type: "message".into(),
-            content: "orphan backlog".into(),
-            summary: None,
-            files: None,
-            read: false,
-            created_at: aionui_common::now_ms(),
-        })
+        .write_message(
+            "user1",
+            &aionui_db::models::MailboxMessageRow {
+                id: "mailbox-orphan-1".into(),
+                team_id: created.id.clone(),
+                to_agent_id: lead_slot_id.clone(),
+                from_agent_id: "worker-or-user".into(),
+                msg_type: "message".into(),
+                content: "orphan backlog".into(),
+                summary: None,
+                files: None,
+                read: false,
+                created_at: aionui_common::now_ms(),
+            },
+        )
         .await
         .expect("seed orphan mailbox");
 
@@ -1694,9 +2057,12 @@ async fn recovery_creates_background_intents_without_restoring_old_memory_run() 
     let requests = turn_port.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].slot_id, lead_slot_id);
-    assert_eq!(
-        requests[0].team_run_id, None,
-        "recovery work must not synthesize a user-visible TeamRun"
+    // Recovery drain now runs the recovered turn inside a freshly opened
+    // SystemLifecycle run (not run-less background, and not a restored
+    // pre-restart run), so the recovered turn carries a run id.
+    assert!(
+        requests[0].team_run_id.is_some(),
+        "recovery work must run inside a system run, not run-less background"
     );
 }
 
@@ -1781,18 +2147,21 @@ async fn ensure_session_does_not_run_self_message_only_recovery_turn() {
         .expect("clear existing session");
 
     team_repo
-        .write_message(&aionui_db::models::MailboxMessageRow {
-            id: "mailbox-self-1".into(),
-            team_id: created.id.clone(),
-            to_agent_id: lead_slot_id.clone(),
-            from_agent_id: lead_slot_id,
-            msg_type: "message".into(),
-            content: "self backlog".into(),
-            summary: None,
-            files: None,
-            read: false,
-            created_at: aionui_common::now_ms(),
-        })
+        .write_message(
+            "user1",
+            &aionui_db::models::MailboxMessageRow {
+                id: "mailbox-self-1".into(),
+                team_id: created.id.clone(),
+                to_agent_id: lead_slot_id.clone(),
+                from_agent_id: lead_slot_id,
+                msg_type: "message".into(),
+                content: "self backlog".into(),
+                summary: None,
+                files: None,
+                read: false,
+                created_at: aionui_common::now_ms(),
+            },
+        )
         .await
         .expect("seed self mailbox");
 
@@ -1891,6 +2260,7 @@ fn setup_with_factory_recording_broadcaster_and_conversation_repo(factory: Agent
 fn make_agent_metadata_row(id: &str, backend: &str, icon: &str) -> AgentMetadataRow {
     AgentMetadataRow {
         id: id.to_owned(),
+        user_id: None,
         icon: Some(icon.to_owned()),
         name: backend.to_owned(),
         name_i18n: None,
@@ -2146,6 +2516,8 @@ async fn renew_active_lease_allows_empty_team_without_unrelated_lease() {
             agents_version: "1.0.1".into(),
             created_at: aionui_common::now_ms(),
             updated_at: aionui_common::now_ms(),
+            project_id: None,
+            folder_id: None,
         })
         .await
         .expect("insert empty team");
@@ -2183,7 +2555,7 @@ async fn renew_active_lease_rejects_team_owned_by_other_user() {
         .await
         .unwrap_err();
 
-    assert!(matches!(err, TeamError::Forbidden(_)));
+    assert!(matches!(err, TeamError::TeamNotFound(_)));
     for agent in &created.assistants {
         assert!(!active_leases.is_active(&agent.conversation_id));
     }
@@ -2191,6 +2563,7 @@ async fn renew_active_lease_rejects_team_owned_by_other_user() {
 
 async fn force_team_workspace(repo: &Arc<FullMockTeamRepo>, team_id: &str, workspace: &str) {
     repo.update_team(
+        "user1",
         team_id,
         &aionui_db::UpdateTeamParams {
             workspace: Some(workspace.to_owned()),
@@ -2288,6 +2661,60 @@ async fn create_team_with_workspace_writes_same_workspace_to_team_and_initial_ag
             Some(workspace.as_str())
         );
     }
+}
+
+#[tokio::test]
+async fn create_team_side_branch_backfills_project_binding_when_injected() {
+    // Project-bind side branch: with a ProjectService injected, create_team
+    // resolves the team workspace and backfills teams.project_id/folder_id.
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo::empty());
+    let (svc, team_repo, _tm, _conv_repo) =
+        setup_with_factory_metadata_team_repo_and_conversation_repo(success_factory(), agent_metadata_repo);
+
+    // Real store on an in-memory DB; leaked so the shared pool outlives the test.
+    let db = aionui_db::init_database_memory().await.unwrap();
+    // The project tables carry a users(id) FK; seed the acting owner as in
+    // production, where the owner row always exists.
+    sqlx::query(
+        "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+         VALUES ('user1', 'local', 'user1', 'hash', 'active', 0, 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let store: Arc<dyn aionui_db::IProjectStore> = Arc::new(aionui_db::SqliteProjectStore::new(db.pool().clone()));
+    std::mem::forget(db);
+    svc.with_project_service(Arc::new(aionui_project::ProjectService::new(
+        store,
+        std::env::temp_dir().join("aionui-team-bind-test-conversations"),
+    )));
+
+    let workspace_dir = std::env::temp_dir().join(format!("aionui-team-bind-{}", aionui_common::generate_id()));
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Bound".into(),
+                agents: two_agent_input(),
+                workspace: Some(workspace_dir.to_string_lossy().into_owned()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let row = team_repo.get_team("user1", &created.id).await.unwrap().unwrap();
+    assert!(
+        row.project_id.is_some(),
+        "team create side branch should backfill project_id"
+    );
+    assert!(
+        row.folder_id.is_some(),
+        "team create side branch should backfill folder_id"
+    );
+    // Transitional workspace column must be untouched by the side branch.
+    assert_eq!(row.workspace, workspace_dir.to_string_lossy());
 }
 
 #[tokio::test]
@@ -2465,7 +2892,7 @@ async fn tc_create_team_carries_assistant_identity_into_lead_conversation_extra(
         .unwrap();
 
     let row = conv_repo
-        .get(&resp.assistants[0].conversation_id)
+        .get("user1", &resp.assistants[0].conversation_id)
         .await
         .unwrap()
         .expect("lead conversation row");
@@ -3333,7 +3760,7 @@ async fn tg3_get_team_rejects_cross_user_access() {
 
     let result = svc.get_team("user2", &created.id).await;
 
-    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
+    assert!(matches!(result, Err(aionui_team::TeamError::TeamNotFound(_))));
 }
 
 // -- Delete team --------------------------------------------------------------
@@ -3411,7 +3838,7 @@ async fn tr5_rename_team_rejects_cross_user_access() {
 
     let result = svc.rename_team("user2", &created.id, "Nope").await;
 
-    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
+    assert!(matches!(result, Err(aionui_team::TeamError::TeamNotFound(_))));
 }
 
 // ===========================================================================
@@ -3464,7 +3891,7 @@ async fn aa1_add_agent_to_team() {
 }
 
 #[tokio::test]
-async fn manual_add_without_active_run_queues_background_welcome_without_creating_run() {
+async fn manual_add_without_active_run_opens_system_lifecycle_run() {
     let (svc, _, conv_repo) = setup_with_factory_and_metadata_and_conversation_repo(
         success_factory(),
         Arc::new(StubAgentMetadataRepo::empty()),
@@ -3528,7 +3955,12 @@ async fn manual_add_without_active_run_queues_background_welcome_without_creatin
     assert!(added_content["content"].as_str().unwrap().contains("manually added"));
 
     let run_state = svc.get_run_state("user1", &created.id).await.unwrap();
-    assert!(run_state.active_run.is_none());
+    // Manual add during an idle team now opens a SystemLifecycle run so the
+    // welcome and membership-change turns run inside a run (invariant: no
+    // run-less turn), rather than falling to run-less background as before.
+    let active_run = run_state.active_run.expect("manual add must open a system run");
+    assert_eq!(active_run.source, TeamRunSource::SystemLifecycle);
+    assert!(!active_run.has_user_intervention);
     assert!(run_state.slot_work.iter().any(|slot| slot.slot_id == added.slot_id));
 }
 
@@ -3804,7 +4236,10 @@ async fn manual_add_agent_attach_failure_marks_slot_error_without_leader_notice(
     );
 
     let lead_slot_id = created.leader_assistant_id.as_deref().expect("leader slot");
-    let leader_messages = team_repo.get_history(&created.id, lead_slot_id, None).await.unwrap();
+    let leader_messages = team_repo
+        .get_history("user1", &created.id, lead_slot_id, None)
+        .await
+        .unwrap();
     assert!(
         !leader_messages
             .iter()
@@ -4139,7 +4574,7 @@ async fn remove_during_attach_cancels_work_and_rejects_late_ready() {
 
     assert!(task_manager.get_task(&added.conversation_id).is_none());
     assert!(
-        conv_repo.get(&added.conversation_id).await.unwrap().is_none(),
+        conv_repo.get("user1", &added.conversation_id).await.unwrap().is_none(),
         "removed attaching member conversation must be deleted"
     );
     assert!(
@@ -4539,7 +4974,7 @@ async fn provisioning_resolves_acp_backend_from_agent_metadata() {
         .unwrap();
 
     let row = conv_repo
-        .get(&created.assistants[0].conversation_id)
+        .get("user1", &created.assistants[0].conversation_id)
         .await
         .unwrap()
         .expect("conversation row");
@@ -4631,7 +5066,7 @@ async fn membership_persist_failure_does_not_delete_the_conversation() {
 
     assert!(error.to_string().contains("forced agent update failure"));
     assert!(
-        conv_repo.get(&worker.conversation_id).await.unwrap().is_some(),
+        conv_repo.get("user1", &worker.conversation_id).await.unwrap().is_some(),
         "conversation deletion must happen only after membership persistence"
     );
     assert!(
@@ -4678,7 +5113,7 @@ async fn remove_tolerates_current_session_already_missing_the_slot() {
         .await
         .expect("post-persistence runtime cleanup must be idempotent");
 
-    assert!(conv_repo.get(&worker.conversation_id).await.unwrap().is_none());
+    assert!(conv_repo.get("user1", &worker.conversation_id).await.unwrap().is_none());
     assert!(
         svc.get_team("user1", &created.id)
             .await
@@ -5006,7 +5441,7 @@ async fn leader_spawn_then_immediate_ensure_joins_the_same_attach_operation() {
 }
 
 #[tokio::test]
-async fn lead_send_agent_message_in_session_requires_active_team_run() {
+async fn lead_send_agent_message_without_active_run_opens_system_lifecycle_run() {
     let svc = setup();
     let created = svc
         .create_team(
@@ -5020,9 +5455,11 @@ async fn lead_send_agent_message_in_session_requires_active_team_run() {
         .await
         .expect("create team");
 
+    // Session loaded with NO active team run: this is the run-less window in
+    // which the leader autonomously wakes a teammate.
     svc.ensure_session("user1", &created.id)
         .await
-        .expect("session should be loaded without active Team Run");
+        .expect("session should load without an active team run");
 
     let lead_slot_id = created
         .leader_assistant_id
@@ -5035,11 +5472,64 @@ async fn lead_send_agent_message_in_session_requires_active_team_run() {
         .map(|agent| agent.slot_id.clone())
         .expect("seeded teammate slot");
 
-    let err = svc
+    // Pre-fix: this returned Err("no active team run for run-scoped wake").
+    // Post-fix: the wake is a legitimate work initiation and succeeds.
+    let result = svc
         .send_agent_message_from_agent(&created.id, &lead_slot_id, &worker_slot_id, "Do this", None)
         .await
-        .expect_err("leader direct message should require active Team Run");
-    assert!(err.to_string().contains("no active team run"));
+        .expect("run-less run-scoped wake must now succeed");
+    assert!(result.team_run_id.is_some(), "the wake must land inside a team run");
+
+    let run_state = svc.get_run_state("user1", &created.id).await.unwrap();
+    let active_run = run_state
+        .active_run
+        .expect("run-scoped wake must open/attach an active team run");
+    assert_eq!(active_run.source, TeamRunSource::SystemLifecycle);
+    assert!(!active_run.has_user_intervention);
+}
+
+#[tokio::test]
+async fn lead_shutdown_agent_without_active_run_opens_system_lifecycle_run() {
+    let svc = setup();
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "Alpha".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .expect("create team");
+    svc.ensure_session("user1", &created.id)
+        .await
+        .expect("session should load without an active team run");
+
+    let lead_slot_id = created
+        .leader_assistant_id
+        .clone()
+        .expect("created team should have a lead slot");
+    let worker_slot_id = created
+        .assistants
+        .iter()
+        .find(|agent| agent.role == "teammate")
+        .map(|agent| agent.slot_id.clone())
+        .expect("seeded teammate slot");
+
+    // team_shutdown_agent shares the same InheritRunningBatch binding as send
+    // and is NOT gated by the (now-deleted) guard. Pre-fix it enqueued run-less
+    // ("background") and opened NO run; post-fix it lands in an active run.
+    svc.shutdown_agent_in_session(&created.id, &lead_slot_id, &worker_slot_id, Some("done".into()))
+        .await
+        .expect("leader shutdown of a teammate must succeed");
+
+    let run_state = svc.get_run_state("user1", &created.id).await.unwrap();
+    let active_run = run_state
+        .active_run
+        .expect("shutdown wake must open/attach an active team run");
+    assert_eq!(active_run.source, TeamRunSource::SystemLifecycle);
+    assert!(!active_run.has_user_intervention);
 }
 
 #[tokio::test]
@@ -5177,7 +5667,7 @@ async fn es4_ensure_session_rejects_cross_user_access() {
 
     let result = svc.ensure_session("user2", &created.id).await;
 
-    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
+    assert!(matches!(result, Err(aionui_team::TeamError::TeamNotFound(_))));
 }
 
 // -- W5-D31b-2: team.sessionStatusChanged service-layer broadcasts -----------
@@ -5191,19 +5681,10 @@ async fn d31b2_ensure_session_broadcasts_failed_loading_team_for_missing_team() 
     let err = svc.ensure_session("user1", "nonexistent-team-xyz").await.unwrap_err();
     assert!(matches!(err, aionui_team::TeamError::TeamNotFound(_)));
 
-    let failed = recorder
-        .events_by_name("team.sessionStatusChanged")
-        .into_iter()
-        .find(|e| {
-            e.data.get("status").and_then(|v| v.as_str()) == Some("failed")
-                && e.data.get("phase").and_then(|v| v.as_str()) == Some("loading_team")
-        })
-        .expect("failed/loading_team broadcast expected");
-    assert_eq!(
-        failed.data.get("team_id").and_then(|v| v.as_str()),
-        Some("nonexistent-team-xyz")
+    assert!(
+        recorder.events_by_name("team.sessionStatusChanged").is_empty(),
+        "missing teams should not emit session status events"
     );
-    assert!(failed.data.get("error").is_some());
 }
 
 #[tokio::test]
@@ -5334,7 +5815,7 @@ async fn ss4_stop_session_rejects_cross_user_access() {
 
     let result = svc.stop_session("user2", &created.id).await;
 
-    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
+    assert!(matches!(result, Err(aionui_team::TeamError::TeamNotFound(_))));
 }
 
 // ===========================================================================
@@ -5386,7 +5867,7 @@ async fn sm2_send_message_rejects_cross_user_access() {
 
     let result = svc.send_message("user2", &created.id, "Hello", None).await;
 
-    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
+    assert!(matches!(result, Err(aionui_team::TeamError::TeamNotFound(_))));
 }
 
 #[tokio::test]
@@ -5431,7 +5912,7 @@ async fn sa2_send_message_to_agent_rejects_cross_user_access() {
         .send_message_to_agent("user2", &created.id, &worker_slot, "Do this", None)
         .await;
 
-    assert!(matches!(result, Err(aionui_team::TeamError::Forbidden(_))));
+    assert!(matches!(result, Err(aionui_team::TeamError::TeamNotFound(_))));
 }
 
 #[tokio::test]
@@ -6471,9 +6952,12 @@ async fn attach_agent_runtime_rejects_cross_user() {
         .attach_agent_runtime("intruder", &created.id, &worker.slot_id)
         .await
         .expect_err("cross-user directed attach must be rejected");
+    // User-scope convention: cross-user access returns TeamNotFound (404) to
+    // avoid leaking team existence, consistent with every other cross-user
+    // team operation on this branch.
     assert!(
-        matches!(error, TeamError::Forbidden(_)),
-        "expected Forbidden, got {error:?}"
+        matches!(error, TeamError::TeamNotFound(_)),
+        "expected TeamNotFound, got {error:?}"
     );
 }
 
@@ -6720,7 +7204,10 @@ async fn lazy_attach_failure_preserves_unread_and_skips_leader_on_human_delivery
 
     // Preserve-unread (spec 5.4b): the delivered message must remain unread so a
     // retry re-drains it via reconcile_mailbox.
-    let worker_unread = team_repo.peek_unread(&created.id, &worker.slot_id).await.unwrap();
+    let worker_unread = team_repo
+        .peek_unread("user1", &created.id, &worker.slot_id)
+        .await
+        .unwrap();
     assert!(
         worker_unread.iter().any(|message| message.content == "please do X"),
         "a failed lazy attach must not mark the pending delivery read"
@@ -6728,7 +7215,10 @@ async fn lazy_attach_failure_preserves_unread_and_skips_leader_on_human_delivery
 
     // Human-direct failure must NOT wake the leader (spec 5.4c): the failure is
     // surfaced inline to the user instead.
-    let lead_unread = team_repo.peek_unread(&created.id, &lead.slot_id).await.unwrap();
+    let lead_unread = team_repo
+        .peek_unread("user1", &created.id, &lead.slot_id)
+        .await
+        .unwrap();
     assert!(
         !lead_unread
             .iter()
@@ -6804,7 +7294,10 @@ async fn agent_triggered_attach_failure_notifies_leader() {
     // re-delegate.
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            let leader_messages = team_repo.get_history(&created.id, &lead_slot_id, None).await.unwrap();
+            let leader_messages = team_repo
+                .get_history("user1", &created.id, &lead_slot_id, None)
+                .await
+                .unwrap();
             if leader_messages.iter().any(|message| {
                 message.from_agent_id == spawned.slot_id && message.content.contains("failed to start its runtime")
             }) {
@@ -6815,4 +7308,278 @@ async fn agent_triggered_attach_failure_notifies_leader() {
     })
     .await
     .expect("an agent-triggered attach failure must notify the leader (notify_leader_on_failure=true)");
+}
+
+// ===========================================================================
+// Test: Team activity read endpoints (mailbox & tasks)
+// ===========================================================================
+
+fn activity_team_row(id: &str, user_id: &str) -> aionui_db::models::TeamRow {
+    aionui_db::models::TeamRow {
+        id: id.into(),
+        user_id: user_id.into(),
+        name: "Activity Team".into(),
+        workspace: String::new(),
+        workspace_mode: "shared".into(),
+        agents: "[]".into(),
+        lead_agent_id: None,
+        session_mode: None,
+        agents_version: "1.0.1".into(),
+        created_at: aionui_common::now_ms(),
+        updated_at: aionui_common::now_ms(),
+        project_id: None,
+        folder_id: None,
+    }
+}
+
+fn activity_message_row(id: &str, team_id: &str, created_at: i64) -> aionui_db::models::MailboxMessageRow {
+    aionui_db::models::MailboxMessageRow {
+        id: id.into(),
+        team_id: team_id.into(),
+        to_agent_id: "a1".into(),
+        from_agent_id: "lead".into(),
+        msg_type: "message".into(),
+        content: format!("content-{id}"),
+        summary: None,
+        files: None,
+        read: false,
+        created_at,
+    }
+}
+
+fn activity_task_row(id: &str, team_id: &str, created_at: i64) -> aionui_db::models::TeamTaskRow {
+    aionui_db::models::TeamTaskRow {
+        id: id.into(),
+        team_id: team_id.into(),
+        subject: format!("subject-{id}"),
+        description: None,
+        status: "pending".into(),
+        owner: Some("a1".into()),
+        blocked_by: "[]".into(),
+        blocks: "[]".into(),
+        metadata: Some(r#"{"secret":"xxx"}"#.into()),
+        created_at,
+        updated_at: created_at,
+    }
+}
+
+#[tokio::test]
+async fn list_team_mailbox_happy_path_orders_desc() {
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo.create_team(&activity_team_row("t1", "user1")).await.unwrap();
+    for i in 1..=3 {
+        team_repo
+            .write_message("user1", &activity_message_row(&format!("m{i}"), "t1", i as i64 * 1000))
+            .await
+            .unwrap();
+    }
+
+    let messages = svc.list_team_mailbox("user1", "t1", 500).await.unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0].id, "m3");
+    assert_eq!(messages[2].id, "m1");
+    // Response envelope-friendly DTO fields present, files normalized to a list.
+    assert!(messages[0].files.is_empty());
+}
+
+#[tokio::test]
+async fn list_team_mailbox_clamps_over_limit() {
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo.create_team(&activity_team_row("t1", "user1")).await.unwrap();
+    for i in 1..=5 {
+        team_repo
+            .write_message("user1", &activity_message_row(&format!("m{i}"), "t1", i as i64 * 1000))
+            .await
+            .unwrap();
+    }
+
+    // Over-limit is clamped to MAX (1000); still returns all 5.
+    let messages = svc.list_team_mailbox("user1", "t1", 99_999).await.unwrap();
+    assert_eq!(messages.len(), 5);
+}
+
+#[tokio::test]
+async fn list_team_tasks_happy_path_desc_and_truncates_without_metadata() {
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo.create_team(&activity_team_row("t1", "user1")).await.unwrap();
+    for i in 1..=4 {
+        team_repo
+            .create_task("user1", &activity_task_row(&format!("tk{i}"), "t1", i as i64 * 1000))
+            .await
+            .unwrap();
+    }
+
+    let tasks = svc.list_team_tasks("user1", "t1", 2).await.unwrap();
+    // DESC by created_at, truncated to 2.
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(tasks[0].id, "tk4");
+    assert_eq!(tasks[1].id, "tk3");
+    // Metadata is never exposed on the response DTO (compile-time guarantee:
+    // the field does not exist), and serialized JSON must not contain it.
+    let json = serde_json::to_value(&tasks[0]).unwrap();
+    assert!(json.get("metadata").is_none());
+    assert!(!serde_json::to_string(&tasks).unwrap().contains("secret"));
+}
+
+#[tokio::test]
+async fn list_team_mailbox_missing_team_returns_not_found() {
+    let (svc, _team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let err = svc.list_team_mailbox("user1", "missing", 500).await.unwrap_err();
+    assert!(matches!(err, TeamError::TeamNotFound(_)));
+}
+
+#[tokio::test]
+async fn list_team_tasks_missing_team_returns_not_found() {
+    let (svc, _team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    let err = svc.list_team_tasks("user1", "missing", 500).await.unwrap_err();
+    assert!(matches!(err, TeamError::TeamNotFound(_)));
+}
+
+#[tokio::test]
+async fn list_team_activity_rejects_other_user() {
+    let (svc, team_repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo.create_team(&activity_team_row("t1", "user1")).await.unwrap();
+    team_repo
+        .write_message("user1", &activity_message_row("m1", "t1", 1000))
+        .await
+        .unwrap();
+
+    // Cross-user access is scoped away at the query layer: another user's team
+    // is indistinguishable from a non-existent one (TeamNotFound), so existence
+    // is never leaked. This matches the team-wide isolation model.
+    let mailbox_err = svc.list_team_mailbox("intruder", "t1", 500).await.unwrap_err();
+    assert!(matches!(mailbox_err, TeamError::TeamNotFound(_)));
+    let tasks_err = svc.list_team_tasks("intruder", "t1", 500).await.unwrap_err();
+    assert!(matches!(tasks_err, TeamError::TeamNotFound(_)));
+}
+
+// ── Unified paginated activity feed (list_team_activity) ──────────────
+
+#[tokio::test]
+async fn activity_all_merges_and_orders_desc_with_cursor() {
+    let (svc, team_repo, _tm, _cr) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo.create_team(&activity_team_row("t1", "user1")).await.unwrap();
+    // Interleaved timestamps: msg@1000,3000  task@2000,4000.
+    for (id, ts) in [("m1", 1000), ("m2", 3000)] {
+        team_repo
+            .write_message("user1", &activity_message_row(id, "t1", ts))
+            .await
+            .unwrap();
+    }
+    for (id, ts) in [("k1", 2000), ("k2", 4000)] {
+        team_repo
+            .create_task("user1", &activity_task_row(id, "t1", ts))
+            .await
+            .unwrap();
+    }
+
+    let page = svc
+        .list_team_activity(
+            "user1",
+            "t1",
+            None,
+            aionui_db::PageDirection::Desc,
+            aionui_team::ActivityKind::All,
+            3,
+        )
+        .await
+        .unwrap();
+
+    // desc top3: k2(4000), m2(3000), k1(2000)
+    let ids: Vec<_> = page.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(ids, ["k2", "m2", "k1"]);
+    assert!(page.has_more); // m1 not yet fetched
+    let c = page.next_cursor.unwrap();
+    assert_eq!((c.ts, c.id.as_str()), (2000, "k1"));
+
+    // Next page.
+    let page2 = svc
+        .list_team_activity(
+            "user1",
+            "t1",
+            Some(aionui_db::ActivityCursor {
+                created_at: c.ts,
+                id: c.id,
+            }),
+            aionui_db::PageDirection::Desc,
+            aionui_team::ActivityKind::All,
+            3,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page2.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["m1"]);
+    assert!(!page2.has_more);
+}
+
+#[tokio::test]
+async fn activity_kind_task_only_paginates_tasks() {
+    let (svc, team_repo, _tm, _cr) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo.create_team(&activity_team_row("t1", "user1")).await.unwrap();
+    team_repo
+        .write_message("user1", &activity_message_row("m1", "t1", 5000))
+        .await
+        .unwrap();
+    team_repo
+        .create_task("user1", &activity_task_row("k1", "t1", 1000))
+        .await
+        .unwrap();
+
+    let page = svc
+        .list_team_activity(
+            "user1",
+            "t1",
+            None,
+            aionui_db::PageDirection::Desc,
+            aionui_team::ActivityKind::Task,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert!(matches!(page.items[0].kind, aionui_api_types::TeamActivityKind::Task));
+}
+
+#[tokio::test]
+async fn activity_rejects_other_user() {
+    let (svc, team_repo, _tm, _cr) = setup_with_factory_metadata_team_repo_and_conversation_repo(
+        success_factory(),
+        Arc::new(StubAgentMetadataRepo::empty()),
+    );
+    team_repo.create_team(&activity_team_row("t1", "user1")).await.unwrap();
+    let err = svc
+        .list_team_activity(
+            "intruder",
+            "t1",
+            None,
+            aionui_db::PageDirection::Desc,
+            aionui_team::ActivityKind::All,
+            10,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TeamError::TeamNotFound(_)));
 }

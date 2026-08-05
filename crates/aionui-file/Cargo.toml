@@ -5,11 +5,14 @@ edition.workspace = true
 
 [dependencies]
 aionui-api-types.workspace = true
+aionui-auth.workspace = true
 aionui-common.workspace = true
+aionui-project.workspace = true
 aionui-realtime.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 tokio.workspace = true
+tower.workspace = true
 tower-http.workspace = true
 walkdir.workspace = true
 ignore.workspace = true

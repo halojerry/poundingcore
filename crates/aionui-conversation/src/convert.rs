@@ -65,6 +65,7 @@ pub fn row_to_response_with_extra(
     Ok(ConversationResponse {
         id: row.id,
         name: row.name,
+        name_source: row.name_source,
         r#type: agent_type,
         model,
         status,
@@ -74,6 +75,11 @@ pub fn row_to_response_with_extra(
         pinned_at: row.pinned_at,
         channel_chat_id: row.channel_chat_id,
         assistant: None,
+        project_id: row.project_id,
+        // Detail-path post-fill only (see `attach_fork_capability`); convert
+        // stays a pure mapper with no repo access.
+        fork_capability: None,
+        prompt_capability: None,
         created_at: row.created_at,
         modified_at: row.updated_at,
         extra,
@@ -156,6 +162,7 @@ pub fn row_to_message_response(row: MessageRow) -> Result<MessageResponse, Conve
         status,
         hidden: row.hidden,
         created_at: row.created_at,
+        backend_turn_id: row.backend_turn_id,
     })
 }
 
@@ -292,6 +299,9 @@ pub fn search_row_to_item(row: MessageSearchRow, data_dir: &Path) -> Result<Mess
         pinned_at: row.conversation_pinned_at,
         created_at: row.conversation_created_at,
         updated_at: row.conversation_updated_at,
+        project_id: None,
+        folder_id: None,
+        name_source: None,
     };
 
     let conversation = row_to_response(conversation_row, data_dir)?;
@@ -333,6 +343,9 @@ mod tests {
             pinned_at: None,
             created_at: 1000,
             updated_at: 2000,
+            project_id: None,
+            folder_id: None,
+            name_source: None,
         }
     }
 
@@ -365,6 +378,22 @@ mod tests {
     }
 
     #[test]
+    fn row_to_response_carries_project_id() {
+        let row = ConversationRow {
+            project_id: Some("prj_abc".into()),
+            ..make_row("acp", "pending", None, None, "{}")
+        };
+        let resp = row_to_response(row, Path::new("/tmp/data")).unwrap();
+        assert_eq!(resp.project_id.as_deref(), Some("prj_abc"));
+    }
+
+    #[test]
+    fn row_to_response_project_id_none_when_unbound() {
+        let resp = row_to_response(make_row("acp", "pending", None, None, "{}"), Path::new("/tmp/data")).unwrap();
+        assert_eq!(resp.project_id, None);
+    }
+
+    #[test]
     fn row_to_response_invalid_type() {
         let row = make_row("invalid", "pending", None, None, "{}");
         let err = row_to_response(row, Path::new("/tmp/data")).unwrap_err();
@@ -387,6 +416,9 @@ mod tests {
             pinned_at: None,
             created_at: 1000,
             updated_at: 2000,
+            project_id: None,
+            folder_id: None,
+            name_source: None,
         };
         let err = row_to_response(row, Path::new("/tmp/data")).unwrap_err();
         assert!(matches!(err, ConversationError::Internal { .. }));
@@ -483,6 +515,9 @@ mod tests {
             pinned_at: Some(5000),
             created_at: 1000,
             updated_at: 3000,
+            project_id: None,
+            folder_id: None,
+            name_source: None,
         };
         let resp = row_to_response(row, Path::new("/tmp/data")).unwrap();
         assert!(resp.pinned);

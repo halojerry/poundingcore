@@ -25,7 +25,10 @@ use crate::member_runtime::{
 use crate::message_projection::{
     TeamMessageProjection, TeamProjectionMessageStore, TeamProjectionRequest, TeamProjectionSource, teammate_dedupe_key,
 };
-use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort};
+use crate::ports::{
+    AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, NoopNativeSlashCommandPort,
+    SlashCommandRecognition,
+};
 use crate::prompt_dump::{TeamPromptDumpConfig, TeamWakePromptDump, dump_team_wake_prompt};
 use crate::prompts::{build_lead_prompt_for_transport, build_teammate_prompt_for_transport, build_wake_payload};
 use crate::provisioning::PersistSpawnedAgentRequest;
@@ -90,6 +93,11 @@ pub struct TeamSession {
     turn_port: Arc<dyn AgentTurnExecutionPort>,
     cancellation_port: Arc<dyn AgentTurnCancellationPort>,
     projection_store: Arc<dyn TeamProjectionMessageStore>,
+    /// Recognizes whether a user message is a native backend slash command
+    /// (ELECTRON-3RN). Defaults to a no-op recognizer (every message is ordinary
+    /// text) unless the composition layer injects a real one via
+    /// [`TeamSession::with_slash_command_port`].
+    slash_command_port: Arc<dyn NativeSlashCommandPort>,
     team_run_manager: Arc<TeamRunManager>,
     work_coordinator: Arc<SlotWorkCoordinator>,
     /// Owner user_id for this team — needed when spawn_agent creates a
@@ -166,13 +174,17 @@ impl TeamSession {
         service: Weak<TeamSessionService>,
         prompt_dump: TeamPromptDumpConfig,
     ) -> Result<Self, TeamError> {
-        let mailbox = Arc::new(Mailbox::new(repo.clone()));
-        let task_board = Arc::new(TaskBoard::new(repo));
-        let member_runtimes = Arc::new(MemberRuntimeRegistry::new(generate_id()));
-        let team_run_manager = Arc::new(TeamRunManager::new(
+        // Single emitter shared by mailbox, task board, and the run manager so
+        // all team events reuse the same team-scoped subscription/delivery.
+        let emitter = Arc::new(TeamEventEmitter::new(
             team.id.clone(),
-            Arc::new(TeamEventEmitter::new(team.id.clone(), broadcaster.clone())),
+            user_id.clone(),
+            broadcaster.clone(),
         ));
+        let mailbox = Arc::new(Mailbox::new_for_user(repo.clone(), user_id.clone()).with_events(emitter.clone()));
+        let task_board = Arc::new(TaskBoard::new_for_user(repo, user_id.clone()).with_events(emitter.clone()));
+        let member_runtimes = Arc::new(MemberRuntimeRegistry::new(generate_id()));
+        let team_run_manager = Arc::new(TeamRunManager::new(team.id.clone(), emitter.clone()));
         let work_coordinator = Arc::new(SlotWorkCoordinator::new(
             team.id.clone(),
             member_runtimes.generation().to_owned(),
@@ -181,6 +193,7 @@ impl TeamSession {
 
         let scheduler = Arc::new(TeammateManager::new(
             team.id.clone(),
+            user_id.clone(),
             &team.agents,
             mailbox.clone(),
             task_board.clone(),
@@ -217,6 +230,7 @@ impl TeamSession {
             turn_port,
             cancellation_port,
             projection_store,
+            slash_command_port: Arc::new(NoopNativeSlashCommandPort),
             team_run_manager,
             work_coordinator,
             user_id,
@@ -227,6 +241,16 @@ impl TeamSession {
             prompt_dump,
             recovery_scan_completed: AtomicBool::new(false),
         })
+    }
+
+    /// Inject the composition-layer slash-command recognizer. Called once right
+    /// after `start*` so live team sessions recognize native backend commands;
+    /// omitted in unit tests that don't exercise recognition (the no-op default
+    /// keeps behaviour identical to the pre-fix wrapped-wake path).
+    #[must_use]
+    pub fn with_slash_command_port(mut self, port: Arc<dyn NativeSlashCommandPort>) -> Self {
+        self.slash_command_port = port;
+        self
     }
 
     pub fn team_id(&self) -> &str {
@@ -262,7 +286,11 @@ impl TeamSession {
     }
 
     pub(crate) fn team_event_emitter(&self) -> Arc<TeamEventEmitter> {
-        Arc::new(TeamEventEmitter::new(self.team.id.clone(), self.broadcaster.clone()))
+        Arc::new(TeamEventEmitter::new(
+            self.team.id.clone(),
+            self.user_id.clone(),
+            self.broadcaster.clone(),
+        ))
     }
 
     pub fn team_run_manager(&self) -> &Arc<TeamRunManager> {
@@ -295,7 +323,7 @@ impl TeamSession {
         let Some(service) = self.service.upgrade() else {
             return Ok(TeamToolTransport::Mcp);
         };
-        service.provisioner().team_tool_transport(agent).await
+        service.provisioner().team_tool_transport(&self.user_id, agent).await
     }
 
     pub(crate) async fn prepare_next_batch(&self, slot_id: &str) -> Result<PrepareBatchResult, TeamError> {
@@ -316,7 +344,9 @@ impl TeamSession {
             .work_coordinator
             .set_runtime_constraint(slot_id, runtime_constraint);
         if !update.terminal_message_ids.is_empty() {
-            self.mailbox.mark_read_batch(&update.terminal_message_ids).await?;
+            self.mailbox
+                .mark_read_batch(&self.team.id, &update.terminal_message_ids)
+                .await?;
         }
 
         let unread = self
@@ -355,26 +385,43 @@ impl TeamSession {
                     .into_iter()
                     .map(|member| member.slot_id)
                     .collect();
-                let wake_body = build_wake_payload(&agent, &tasks, &claimed_unread, &current_slot_ids);
-                let needs_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
-                let first_message = if needs_role_prompt {
-                    let tool_transport = self.team_tool_transport_for_agent(&agent).await?;
-                    let role_prompt = match agent.role {
-                        TeammateRole::Lead => build_lead_prompt_for_transport(
-                            &agent,
-                            &self.team.name,
-                            &self.scheduler.list_agents().await,
-                            &[],
-                            tool_transport,
-                        ),
-                        TeammateRole::Teammate => {
-                            let members = self.scheduler.list_agents().await;
-                            build_teammate_prompt_for_transport(&agent, &self.team.name, &members, tool_transport)
-                        }
-                    };
-                    format!("{role_prompt}\n\n{wake_body}")
+                let (first_message, needs_role_prompt) = if batch.is_command {
+                    // ELECTRON-3RN: a recognized slash command turn is sent bare —
+                    // the turn's first content block is the raw command so the
+                    // backend's native slash dispatch (e.g. codex
+                    // `route_slash_command` → `thread/compact/start`) matches,
+                    // byte-for-byte like a direct-session send (AC9). Skip
+                    // `build_wake_payload`'s `## New Messages` wrapping AND the
+                    // role-prompt prefix, and do NOT consume `needs_role_prompt` —
+                    // it belongs to the next real wake turn (AC2).
+                    let command = claimed_unread
+                        .first()
+                        .map(|message| message.content.clone())
+                        .unwrap_or_default();
+                    (command, false)
                 } else {
-                    wake_body
+                    let wake_body = build_wake_payload(&agent, &tasks, &claimed_unread, &current_slot_ids);
+                    let needs_role_prompt = self.scheduler.take_needs_role_prompt(slot_id).await;
+                    let first_message = if needs_role_prompt {
+                        let tool_transport = self.team_tool_transport_for_agent(&agent).await?;
+                        let role_prompt = match agent.role {
+                            TeammateRole::Lead => build_lead_prompt_for_transport(
+                                &agent,
+                                &self.team.name,
+                                &self.scheduler.list_agents().await,
+                                &[],
+                                tool_transport,
+                            ),
+                            TeammateRole::Teammate => {
+                                let members = self.scheduler.list_agents().await;
+                                build_teammate_prompt_for_transport(&agent, &self.team.name, &members, tool_transport)
+                            }
+                        };
+                        format!("{role_prompt}\n\n{wake_body}")
+                    } else {
+                        wake_body
+                    };
+                    (first_message, needs_role_prompt)
                 };
 
                 match dump_team_wake_prompt(
@@ -461,7 +508,7 @@ impl TeamSession {
             self.scheduler.set_status(&slot_id, TeammateStatus::Error).await?;
         }
 
-        let wake_target = self.scheduler.finalize_turn(&slot_id, &[]).await?;
+        let wake_target = self.scheduler.finalize_turn(&slot_id).await?;
 
         // Clear the dedup window unconditionally once finalize has run.
         self.scheduler.clear_finalized_turn(conversation_id);
@@ -538,7 +585,13 @@ impl TeamSession {
         let reservation = self.member_runtimes.reserve_attach(slot_id, false);
         if matches!(reservation, ReserveAttach::Start(_)) {
             let agent = self.scheduler.get_agent(slot_id).await?;
-            service.broadcast_agent_runtime_status(&self.team.id, &agent, TeamAgentRuntimeStatus::Pending, None);
+            service.broadcast_agent_runtime_status(
+                self.user_id(),
+                &self.team.id,
+                &agent,
+                TeamAgentRuntimeStatus::Pending,
+                None,
+            );
             info!(
                 team_id = %self.team.id,
                 slot_id,
@@ -570,10 +623,71 @@ impl TeamSession {
         self.ensure_member_runtime_lazy(slot_id, false).await?;
         self.publish_runtime_constraint(slot_id).await?;
         let agent = self.scheduler.get_agent(slot_id).await?;
-        let source = if self.team_run_manager.current_active_run_id().is_some() {
+        // Fallback classification when the message is NOT a recognized command:
+        // an active team run makes it an intervention, otherwise an ordinary
+        // user message (unchanged pre-fix behaviour → zero regression).
+        let fallback_source = if self.team_run_manager.current_active_run_id().is_some() {
             WorkSource::UserIntervention
         } else {
             WorkSource::UserMessage
+        };
+        // ELECTRON-3RN: recognize native slash commands ONLY at this user entry
+        // point (`send_message` / `send_message_to_agent` both funnel here), so
+        // `send_agent_message_from_agent` (agent→agent) is never treated as a
+        // command (§9-7). `content` is passed and stored verbatim — never
+        // trimmed or rewritten — so the dispatched command is byte-identical to
+        // a direct send (AC9). Logs carry only the command NAME + source, never
+        // `content`/args (§14).
+        let source = match self.slash_command_port.recognize(&agent.conversation_id, content).await {
+            SlashCommandRecognition::Recognized { command, source } => {
+                info!(
+                    team_id = %self.team.id,
+                    slot_id,
+                    conversation_id = %agent.conversation_id,
+                    backend = %agent.backend,
+                    command = %command,
+                    source = source.as_str(),
+                    "team user slash command recognized; dispatching as bare command turn"
+                );
+                WorkSource::UserCommand
+            }
+            SlashCommandRecognition::CatalogEmpty { name } => {
+                warn!(
+                    team_id = %self.team.id,
+                    slot_id,
+                    conversation_id = %agent.conversation_id,
+                    backend = %agent.backend,
+                    command = %name,
+                    reason = "catalog_empty",
+                    "team user message resembles a slash command but the backend command catalog resolved EMPTY; falling back to wrapped wake"
+                );
+                fallback_source
+            }
+            SlashCommandRecognition::CatalogUnavailable { name } => {
+                warn!(
+                    team_id = %self.team.id,
+                    slot_id,
+                    conversation_id = %agent.conversation_id,
+                    backend = %agent.backend,
+                    command = %name,
+                    reason = "catalog_unavailable",
+                    "team user message resembles a slash command but the backend command catalog is unavailable; falling back to wrapped wake"
+                );
+                fallback_source
+            }
+            SlashCommandRecognition::NotInCatalog { name } => {
+                tracing::debug!(
+                    team_id = %self.team.id,
+                    slot_id,
+                    conversation_id = %agent.conversation_id,
+                    backend = %agent.backend,
+                    command = %name,
+                    reason = "not_in_catalog",
+                    "team user message starts with '/' but name is not an advertised command; treating as ordinary text"
+                );
+                fallback_source
+            }
+            SlashCommandRecognition::NotCommand => fallback_source,
         };
         let lease = self.work_coordinator.acquire_enqueue(EnqueueRequest {
             slot_id: slot_id.to_owned(),
@@ -603,6 +717,7 @@ impl TeamSession {
 
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let request = TeamProjectionRequest::user_visible(
+            &self.user_id,
             &self.team.id,
             slot_id,
             &agent.conversation_id,
@@ -654,7 +769,9 @@ impl TeamSession {
         };
         let update = self.work_coordinator.set_runtime_constraint(slot_id, constraint);
         if !update.terminal_message_ids.is_empty() {
-            self.mailbox.mark_read_batch(&update.terminal_message_ids).await?;
+            self.mailbox
+                .mark_read_batch(&self.team.id, &update.terminal_message_ids)
+                .await?;
         }
         Ok(())
     }
@@ -702,6 +819,7 @@ impl TeamSession {
 
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let request = TeamProjectionRequest {
+            user_id: self.user_id.clone(),
             team_id: self.team.id.clone(),
             slot_id: to_slot_id.to_owned(),
             conversation_id: to_agent.conversation_id.clone(),
@@ -816,6 +934,27 @@ impl TeamSession {
         Ok(commit.team_run_id)
     }
 
+    /// Enqueue a system/lifecycle wake so the woken agent's turn always runs
+    /// inside a team run (attaching to the caller's or team's active run, or
+    /// opening a `SystemLifecycle` run when idle). This upholds the invariant
+    /// that every agent turn is run-scoped, so run-scoped tools like
+    /// `team_send_message` are never rejected for a run-less system wake.
+    async fn enqueue_system_work(
+        &self,
+        slot_id: &str,
+        source: WorkSource,
+        mailbox_message_id: Option<String>,
+        inherit_from: Option<String>,
+    ) -> Result<Option<String>, TeamError> {
+        self.enqueue_existing_work(
+            slot_id,
+            source,
+            mailbox_message_id,
+            CausalBinding::SystemInitiated { inherit_from },
+        )
+        .await
+    }
+
     async fn commit_persisted_enqueue(
         &self,
         lease: &EnqueueLease,
@@ -830,7 +969,7 @@ impl TeamSession {
                 self.work_coordinator.abort_enqueue(lease, "enqueue_commit_failed");
                 if let Err(mark_read_error) = self
                     .mailbox
-                    .mark_read_batch(std::slice::from_ref(&mailbox_message_id))
+                    .mark_read_batch(&self.team.id, std::slice::from_ref(&mailbox_message_id))
                     .await
                 {
                     warn!(
@@ -852,8 +991,7 @@ impl TeamSession {
         slot_id: &str,
         source: WorkSource,
     ) -> Result<(), TeamError> {
-        self.enqueue_existing_work(slot_id, source, None, CausalBinding::ActiveRunOrBackground)
-            .await?;
+        self.enqueue_system_work(slot_id, source, None, None).await?;
         Ok(())
     }
 
@@ -888,13 +1026,8 @@ impl TeamSession {
                 continue;
             }
             for message_id in unread {
-                self.enqueue_existing_work(
-                    &agent.slot_id,
-                    WorkSource::RecoveryDrain,
-                    Some(message_id),
-                    CausalBinding::Background,
-                )
-                .await?;
+                self.enqueue_system_work(&agent.slot_id, WorkSource::RecoveryDrain, Some(message_id), None)
+                    .await?;
             }
             recovered_slots.push(agent.slot_id);
         }
@@ -948,6 +1081,7 @@ impl TeamSession {
                 msg.content.clone()
             };
             let request = TeamProjectionRequest {
+                user_id: self.user_id.clone(),
                 team_id: self.team.id.clone(),
                 slot_id: msg.to_agent_id.clone(),
                 conversation_id: input.conversation_id.clone(),
@@ -988,7 +1122,9 @@ impl TeamSession {
         self.team_run_manager.begin_cancel(team_run_id, reason)?;
         let result = self.work_coordinator.cancel_run(team_run_id);
         if !result.terminal_message_ids.is_empty() {
-            self.mailbox.mark_read_batch(&result.terminal_message_ids).await?;
+            self.mailbox
+                .mark_read_batch(&self.team.id, &result.terminal_message_ids)
+                .await?;
         }
         for target in result.cancel_targets {
             let Some(turn_id) = target.turn_id else {
@@ -1172,15 +1308,8 @@ impl TeamSession {
         let Some(message_id) = message_id else {
             return Ok(());
         };
-        self.enqueue_existing_work(
-            &lead_slot_id,
-            source,
-            Some(message_id),
-            CausalBinding::InheritRunningBatch {
-                caller_slot_id: source_slot_id.to_owned(),
-            },
-        )
-        .await?;
+        self.enqueue_system_work(&lead_slot_id, source, Some(message_id), Some(source_slot_id.to_owned()))
+            .await?;
         Ok(())
     }
 
@@ -1240,18 +1369,13 @@ impl TeamSession {
         )
         .await;
 
-        self.enqueue_existing_work(
-            &agent.slot_id,
-            WorkSource::SpawnWelcome,
-            Some(welcome.id),
-            CausalBinding::ActiveRunOrBackground,
-        )
-        .await?;
-        self.enqueue_existing_work(
+        self.enqueue_system_work(&agent.slot_id, WorkSource::SpawnWelcome, Some(welcome.id), None)
+            .await?;
+        self.enqueue_system_work(
             &lead_slot_id,
             WorkSource::TeamMembershipChanged,
             Some(leader_notice.id),
-            CausalBinding::ActiveRunOrBackground,
+            None,
         )
         .await?;
         Ok(())
@@ -1284,13 +1408,8 @@ impl TeamSession {
         self.project_team_system_message(&lead_slot_id, &lead_agent.conversation_id, &notice.id, &notice.content)
             .await;
 
-        self.enqueue_existing_work(
-            &lead_slot_id,
-            WorkSource::TeamMembershipChanged,
-            Some(notice.id),
-            CausalBinding::ActiveRunOrBackground,
-        )
-        .await?;
+        self.enqueue_system_work(&lead_slot_id, WorkSource::TeamMembershipChanged, Some(notice.id), None)
+            .await?;
 
         Ok(())
     }
@@ -1304,6 +1423,7 @@ impl TeamSession {
     ) {
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let request = TeamProjectionRequest::team_system_visible(
+            &self.user_id,
             &self.team.id,
             slot_id,
             conversation_id,
@@ -1340,7 +1460,9 @@ impl TeamSession {
         }
         let work = self.work_coordinator.remove_slot(slot_id);
         if !work.terminal_message_ids.is_empty() {
-            self.mailbox.mark_read_batch(&work.terminal_message_ids).await?;
+            self.mailbox
+                .mark_read_batch(&self.team.id, &work.terminal_message_ids)
+                .await?;
         }
         if let Some(target) = work.cancel_target
             && let Some(turn_id) = target.turn_id
@@ -1421,7 +1543,13 @@ impl TeamSession {
         // capability checks. Assistant spawns derive backend from the preset
         // identity rather than inheriting the caller backend.
         let (backend, model) = service
-            .resolve_spawn_backend_and_model(Some(assistant_id), None, caller.backend.as_str(), caller.model.as_str())
+            .resolve_spawn_backend_and_model(
+                &self.user_id,
+                Some(assistant_id),
+                None,
+                caller.backend.as_str(),
+                caller.model.as_str(),
+            )
             .await?;
 
         // Step 4: DB side-effects (new conversation + persisted agent slot).
@@ -1474,13 +1602,11 @@ impl TeamSession {
             }
         };
 
-        self.enqueue_existing_work(
+        self.enqueue_system_work(
             &new_agent.slot_id,
             WorkSource::SpawnWelcome,
             Some(welcome_message.id),
-            CausalBinding::InheritRunningBatch {
-                caller_slot_id: caller_slot_id.to_owned(),
-            },
+            Some(caller_slot_id.to_owned()),
         )
         .await?;
 
@@ -1643,8 +1769,25 @@ pub(crate) async fn attach_member_runtime(
             .cleanup_stale_member_runtime_task(&session, &agent.conversation_id)
             .await;
         let failure = sanitize_member_runtime_failure(&error);
+        // Log the RAW error before it is sanitized away: the broadcast/public
+        // reason is intentionally generic ("Agent runtime failed to start"),
+        // and without this line production logs carry no trace of the actual
+        // cause (Sentry ELECTRON-3PP was only diagnosable by timing forensics).
+        // TeamError texts here are runtime/spawn diagnostics (never prompts,
+        // tool payloads, or secrets), so info-level visibility is safe.
+        warn!(
+            team_id = session.team_id(),
+            slot_id = agent.slot_id,
+            conversation_id = agent.conversation_id,
+            operation_id,
+            generation,
+            error_classification = failure.classification,
+            error = %error,
+            "team member runtime attach failed"
+        );
         if session.member_runtimes.commit_failed(&lease, failure.clone()) {
             service.broadcast_agent_runtime_status(
+                session.user_id(),
                 session.team_id(),
                 &agent,
                 TeamAgentRuntimeStatus::Failed,
@@ -2280,17 +2423,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_without_active_run_queues_background_work() {
+    async fn shutdown_without_active_run_opens_system_lifecycle_run() {
         let session = start_session().await;
 
         session
             .shutdown_agent("lead-1", "worker-1", Some("done".into()))
             .await
-            .expect("background caller may queue shutdown work");
+            .expect("leader may shut down a teammate");
 
         let unread = session.mailbox().peek_unread("t1", "worker-1").await.unwrap();
         assert_eq!(unread.len(), 1);
-        assert!(session.team_run_manager().current_active_run_id().is_none());
+        // A run-scoped shutdown wake with no inheritable run now converges into a
+        // SystemLifecycle run at the enqueue choke-point instead of enqueuing
+        // run-less background work.
+        assert!(session.team_run_manager().current_active_run_id().is_some());
+        let payload = session
+            .team_run_manager()
+            .current_payload(&session.work_coordinator.snapshot())
+            .expect("shutdown wake must open a run payload");
+        assert_eq!(payload.source, aionui_api_types::TeamRunSource::SystemLifecycle);
+        assert!(!payload.has_user_intervention);
         session.stop();
     }
 
@@ -2500,7 +2652,21 @@ mod tests {
             .expect("scan should not fail");
 
         assert_eq!(result, vec![lead.clone()]);
-        assert!(session.team_run_manager().current_active_run_id().is_none());
+        // Recovery drain now runs the recovered work inside a SystemLifecycle
+        // run instead of run-less background, upholding the invariant that every
+        // recovered turn is run-scoped. The lead's non-self unread drains into
+        // exactly one such run (not one per message).
+        let run_id = session
+            .team_run_manager()
+            .current_active_run_id()
+            .expect("recovery drain must open a system run");
+        let payload = session
+            .team_run_manager()
+            .current_payload(&session.work_coordinator().snapshot())
+            .expect("the recovery system run must be observable");
+        assert_eq!(payload.team_run_id, run_id);
+        assert_eq!(payload.source, aionui_api_types::TeamRunSource::SystemLifecycle);
+        assert!(!payload.has_user_intervention);
     }
 
     #[tokio::test]
@@ -2685,7 +2851,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_turn_is_reported_running_without_a_team_run() {
+    async fn shutdown_turn_is_reported_running_inside_a_system_run() {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let repo: Arc<dyn ITeamRepository> = Arc::new(MockTeamRepo::new());
@@ -2719,7 +2885,15 @@ mod tests {
         let slot = session.work_coordinator.slot_snapshot("worker-1").unwrap();
         assert_eq!(slot.state, SlotPhase::Running);
         assert_eq!(slot.active_turn_id.as_deref(), Some("turn-background"));
-        assert!(session.team_run_manager.current_active_run_id().is_none());
+        // The shutdown wake now converges into a SystemLifecycle run at the
+        // enqueue choke-point, so the reported-running turn lives inside a run
+        // rather than being run-less.
+        assert!(session.team_run_manager.current_active_run_id().is_some());
+        let payload = session
+            .team_run_manager
+            .current_payload(&session.work_coordinator.snapshot())
+            .expect("shutdown wake must open a run payload");
+        assert_eq!(payload.source, aionui_api_types::TeamRunSource::SystemLifecycle);
 
         release_tx.send(()).unwrap();
         session.stop();
@@ -2845,7 +3019,7 @@ mod tests {
     #[test]
     fn session_replacement_rejects_old_generation_batch_and_attach_completion() {
         let old_broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-        let old_emitter = Arc::new(TeamEventEmitter::new("t1".into(), old_broadcaster));
+        let old_emitter = Arc::new(TeamEventEmitter::new("t1".into(), "user-1".into(), old_broadcaster));
         let old_runs = Arc::new(TeamRunManager::new("t1".into(), old_emitter));
         let old_coordinator = SlotWorkCoordinator::new("t1".into(), "old-generation".into(), old_runs);
         old_coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);
@@ -2863,7 +3037,7 @@ mod tests {
         };
 
         let new_broadcaster: Arc<dyn EventBroadcaster> = Arc::new(NullBroadcaster);
-        let new_emitter = Arc::new(TeamEventEmitter::new("t1".into(), new_broadcaster));
+        let new_emitter = Arc::new(TeamEventEmitter::new("t1".into(), "user-1".into(), new_broadcaster));
         let new_runs = Arc::new(TeamRunManager::new("t1".into(), new_emitter));
         let new_coordinator = SlotWorkCoordinator::new("t1".into(), "new-generation".into(), new_runs);
         new_coordinator.set_runtime_constraint("lead-1", RuntimeConstraint::Ready);

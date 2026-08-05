@@ -5,6 +5,7 @@ use crate::capability::prompt_pipeline::PromptPipeline;
 use crate::capability::skill_manager::AcpSkillManager;
 use crate::error::AgentError;
 use crate::factory::acp_assembler::AcpSessionParams;
+use crate::manager::acp::legacy_session_model::LegacySessionModelState;
 use crate::manager::acp::{
     AcpSession, AcpSessionEvent, ModelIdentityReminderHook, PermissionRouter, SessionNewPreludeHook,
 };
@@ -17,10 +18,9 @@ use crate::protocol::send_error::AgentSendError;
 use crate::registry::CatalogSender;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, SessionId as DomainSessionId};
 use crate::types::SendMessageData;
-use agent_client_protocol::schema::SessionConfigOptionCategory;
-use agent_client_protocol::schema::{
-    AvailableCommand, CancelNotification, SessionId, SessionModelState, SessionNotification,
-    SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest, UsageUpdate,
+use agent_client_protocol::schema::v1::{
+    AvailableCommand, CancelNotification, SessionConfigOptionCategory, SessionId, SessionNotification,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, UsageUpdate,
 };
 use aionui_api_types::{
     AgentHandshake, ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionResponse,
@@ -84,6 +84,7 @@ use super::config_option_catalog::{extract_models_from_value, extract_modes_from
 use super::config_options::{ConfigSetPath, ConfigSetPathError, ConfigSnapshot, resolve_set_path};
 use super::mode_normalize::normalize_requested_mode;
 use super::mode_normalize::normalize_requested_mode_for_available_values;
+use super::mode_normalize::{RequiredFullAutoMode, resolve_required_full_auto_mode};
 
 fn normalize_requested_model_id_for_backend(backend: Option<&str>, model_id: &str) -> String {
     if backend == Some("claude") {
@@ -491,6 +492,17 @@ fn mark_session_opened_after_protocol_ready(
 /// (Claude, Qwen, CodeBuddy, Codex, etc.). Communication now happens via
 /// the `agent-client-protocol` SDK's JSON-RPC transport, replacing the
 /// previous hand-crafted JSON-over-stdin/stdout approach.
+
+/// Result of applying cron's full-auto required-runtime-mode (a-pure) for a
+/// metadata-bearing ACP agent. `Applied` set the backend-native YOLO id;
+/// `Skipped` left the session's already-resolved mode untouched because the
+/// resolved id was not selectable in the live catalog (look-before-leap).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequiredFullAutoApplication {
+    Applied { effective: String },
+    Skipped { resolved: String },
+}
+
 pub struct AcpAgentManager {
     /// Pre-computed, immutable session parameters assembled by the factory.
     pub(super) params: Arc<AcpSessionParams>,
@@ -654,7 +666,11 @@ impl AcpAgentManager {
             ..Default::default()
         };
         if init_handshake.agent_capabilities.is_some() || init_handshake.auth_methods.is_some() {
-            catalog_tx.send_partial(self.params.metadata.id.clone(), init_handshake);
+            catalog_tx.send_partial(
+                self.params.user_id.clone(),
+                self.params.metadata.id.clone(),
+                init_handshake,
+            );
         }
 
         // Seed the observed/advertised layers (observed mode/model, cached
@@ -735,7 +751,7 @@ impl AcpAgentManager {
     }
 
     /// Cached model info from the ACP backend, if any has been received.
-    pub(crate) async fn model(&self) -> Option<SessionModelState> {
+    pub(crate) async fn model(&self) -> Option<LegacySessionModelState> {
         self.session.read().await.model_info().cloned()
     }
 
@@ -827,7 +843,7 @@ impl AcpAgentManager {
     }
 
     #[allow(dead_code)]
-    async fn apply_confirmed_model_selection(&self, model_id: &str) -> Result<SessionModelState, AgentError> {
+    async fn apply_confirmed_model_selection(&self, model_id: &str) -> Result<LegacySessionModelState, AgentError> {
         let session_id = {
             let session = self.session.read().await;
             if !session.can_select_model(model_id) {
@@ -859,14 +875,7 @@ impl AcpAgentManager {
             requested_model_id = %model_id,
             "acp_set_model_requested"
         );
-        if let Err(e) = self
-            .protocol
-            .set_model(SetSessionModelRequest::new(
-                SessionId::new(session_id.clone()),
-                model_id.to_owned(),
-            ))
-            .await
-        {
+        if let Err(e) = self.protocol.set_model(&session_id, model_id).await {
             warn!(
                 conversation_id = %self.params.conversation_id,
                 agent_backend = ?self.params.metadata.backend,
@@ -897,7 +906,7 @@ impl AcpAgentManager {
         let confirmed_model = session
             .model_info()
             .cloned()
-            .unwrap_or_else(|| SessionModelState::new(model_id.to_owned(), Vec::new()));
+            .unwrap_or_else(|| LegacySessionModelState::new(model_id.to_owned(), Vec::new()));
         self.commit_session_changes(&mut session).await;
         info!(
             conversation_id = %self.params.conversation_id,
@@ -918,7 +927,7 @@ impl AcpAgentManager {
     /// Set the model and return the confirmed model state from this write,
     /// without re-reading the asynchronously mutable session cache.
     #[allow(dead_code)]
-    pub(crate) async fn set_model_confirmed(&self, model_id: &str) -> Result<SessionModelState, AgentError> {
+    pub(crate) async fn set_model_confirmed(&self, model_id: &str) -> Result<LegacySessionModelState, AgentError> {
         self.apply_confirmed_model_selection(model_id).await
     }
 
@@ -927,6 +936,65 @@ impl AcpAgentManager {
         Ok(GetConfigOptionsResponse {
             config_options: session.config_snapshot().options,
         })
+    }
+
+    /// Live `mode` option ids from this backend's catalog. `None` only on a
+    /// catalog read failure (caller then falls back to the pre-fix
+    /// unnormalized apply); a catalog with no `mode` option yields `Some([])`.
+    async fn live_mode_catalog_ids(&self) -> Option<Vec<String>> {
+        match self.config_options().await {
+            Ok(resp) => Some(
+                resp.config_options
+                    .into_iter()
+                    .find(|opt| opt.id == "mode")
+                    .map(|opt| opt.options.into_iter().map(|o| o.value).collect())
+                    .unwrap_or_default(),
+            ),
+            Err(err) => {
+                warn!(
+                    conversation_id = %self.params.conversation_id,
+                    agent_backend = ?self.params.metadata.backend,
+                    error = %err,
+                    "apply full-auto mode: live catalog read failed — applying resolved mode unnormalized"
+                );
+                None
+            }
+        }
+    }
+
+    /// Apply cron's full-auto required-runtime-mode (a-pure, ELECTRON-3RQ).
+    ///
+    /// A cron turn is ALWAYS a full-auto request, so the persisted literal is
+    /// ignored: resolve "yolo" to this backend's native YOLO id against its
+    /// live mode catalog. Look-before-leap — only set the mode when the
+    /// resolved id is actually selectable; otherwise `warn` and skip the
+    /// override, keeping the session's already-resolved mode (never fail the
+    /// turn). A catalog read failure falls back to the conservative pre-fix
+    /// behaviour: apply the resolved value and let `set_config_option`
+    /// reject it locally if unselectable.
+    pub(crate) async fn apply_required_full_auto_mode(&self) -> Result<RequiredFullAutoApplication, AgentError> {
+        match self.live_mode_catalog_ids().await {
+            Some(ids) => match resolve_required_full_auto_mode(&self.params.metadata, ids.iter().map(String::as_str)) {
+                RequiredFullAutoMode::Apply(mode) => {
+                    self.set_config_option_confirmed("mode", &mode).await?;
+                    Ok(RequiredFullAutoApplication::Applied { effective: mode })
+                }
+                RequiredFullAutoMode::Skip { resolved } => {
+                    warn!(
+                        conversation_id = %self.params.conversation_id,
+                        agent_backend = ?self.params.metadata.backend,
+                        resolved = %resolved,
+                        "apply full-auto mode: resolved YOLO not in live catalog — skipping override, keeping session mode"
+                    );
+                    Ok(RequiredFullAutoApplication::Skipped { resolved })
+                }
+            },
+            None => {
+                let resolved = normalize_requested_mode(&self.params.metadata, "yolo");
+                self.set_config_option_confirmed("mode", &resolved).await?;
+                Ok(RequiredFullAutoApplication::Applied { effective: resolved })
+            }
+        }
     }
 
     pub(crate) async fn set_config_option_confirmed(
@@ -1028,7 +1096,7 @@ impl AcpAgentManager {
                     .set_config_option(SetSessionConfigOptionRequest::new(
                         SessionId::new(session_id.clone()),
                         config_id.clone(),
-                        resolved_value.clone(),
+                        resolved_value.as_str(),
                     ))
                     .await
                     .map_err(|err| {
@@ -1114,10 +1182,7 @@ impl AcpAgentManager {
             }
             ConfigSetPath::LegacyModel => {
                 self.protocol
-                    .set_model(SetSessionModelRequest::new(
-                        SessionId::new(session_id.clone()),
-                        resolved_value.clone(),
-                    ))
+                    .set_model(&session_id, &resolved_value)
                     .await
                     .map_err(|err| {
                         warn!(
@@ -1336,7 +1401,14 @@ impl AcpAgentManager {
         };
 
         let sid = match (session_id, opened) {
-            (None, _) => self.open_session_new().await?,
+            // Unbound + fork spec: the forked conversation's backend session
+            // has not materialized yet → session/fork against the parent sid
+            // (never session/new — that would silently drop the parent
+            // context the user forked for).
+            (None, _) => match self.params.config.fork.as_ref() {
+                Some(fork) => self.open_session_fork(fork).await?,
+                None => self.open_session_new().await?,
+            },
             (Some(sid), false) => self.open_session_resume(&sid).await?,
             (Some(sid), true) => sid,
         };
@@ -1527,6 +1599,18 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
 
     fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.runtime.subscribe()
+    }
+
+    fn prompt_media_caps(&self) -> crate::types::PromptMediaCaps {
+        let caps = self
+            .protocol
+            .agent_capabilities()
+            .map(|c| c.prompt_capabilities)
+            .unwrap_or_default();
+        crate::types::PromptMediaCaps {
+            image: caps.image,
+            audio: caps.audio,
+        }
     }
 
     #[tracing::instrument(skip_all, fields(conversation_id = %self.params.conversation_id, msg_id = %data.msg_id))]
@@ -1787,8 +1871,8 @@ mod tests {
     use crate::manager::acp::config_options::ConfigSnapshot;
     use crate::manager::acp::{AcpAgentManager, AcpSession};
     use crate::protocol::error::{AcpError, CloseReason};
-    use crate::shared_kernel::{ModeId, SessionId as DomainSessionId};
-    use agent_client_protocol::schema::{
+    use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, SessionId as DomainSessionId};
+    use agent_client_protocol::schema::v1::{
         AvailableCommand, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
     };
     use aionui_api_types::{AgentHandshake, AgentMetadata, AgentSource, AgentSourceInfo, BehaviorPolicy};

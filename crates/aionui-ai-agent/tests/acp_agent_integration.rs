@@ -75,6 +75,7 @@ async fn make_mock_agent(script: &str, backend: &str) -> (Arc<AcpAgentManager>, 
         mcp_server_ids: None,
         session_mcp_servers: vec![],
         user_id: None,
+        fork: None,
     };
 
     let tmp_skills = tempfile::TempDir::new().unwrap();
@@ -98,6 +99,7 @@ async fn make_mock_agent(script: &str, backend: &str) -> (Arc<AcpAgentManager>, 
     let params = Arc::new(
         assemble_acp_params(
             "test-conv-1".into(),
+            "user-acp-test".into(),
             WorkspaceInfo {
                 path: "/tmp".into(),
                 is_custom: true,
@@ -194,6 +196,9 @@ fn event_type_name(event: &AgentStreamEvent) -> &'static str {
         AgentStreamEvent::SlashCommandsUpdated(_) => "SlashCommandsUpdated",
         AgentStreamEvent::SessionAssigned(_) => "SessionAssigned",
         AgentStreamEvent::SegmentBreak => "SegmentBreak",
+        AgentStreamEvent::BackendTurnBound(_) => "BackendTurnBound",
+        AgentStreamEvent::WorkflowProgress(_) => "WorkflowProgress",
+        AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
     }
 }
 

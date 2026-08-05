@@ -53,23 +53,25 @@ pub use adapter::{AgentIo, ManagedProcessIo, is_valid_claude_permission_mode};
 // `command`/`session` modules that forced the `BackendCommand`/`BackendSessionSpec`
 // aliases, so these are now exported under their plain names.
 pub use backend::{
-    AcpConnection, AcpSessionBackend, Admission, BackendConnection, BackendError, CancelTarget, ClaudeConnection,
-    ClaudeSessionBackend, CodexConnection, CodexSessionBackend, Command, CommandMeta, CommandReceipt, ContentBlock,
-    ConversationSession, McpServerSpec, McpTransport, MsgStatus, Orchestrator, PendingMessage, PendingPermissionView,
-    PermissionDecision, QuestionAnswer, SessionBackend, SessionConfig, SessionEnvelope, SessionInfoKind, SessionInit,
-    SessionSpec, StateSnapshot, Tier2Checkpoint, TransitionReason, acp_capabilities, codex_capabilities, command_name,
-    rehydrate,
+    AcpConnection, AcpSessionBackend, Admission, AntigravityConnection, AntigravitySessionBackend, BackendConnection,
+    BackendError, CancelTarget, ClaudeConnection, ClaudeSessionBackend, CodexConnection, CodexSessionBackend, Command,
+    CommandMeta, CommandReceipt, ContentBlock, ConversationSession, McpServerSpec, McpTransport, MsgStatus,
+    Orchestrator, PendingMessage, PendingPermissionView, PermissionDecision, QuestionAnswer, SessionBackend,
+    SessionConfig, SessionEnvelope, SessionInfoKind, SessionInit, SessionSpec, StateSnapshot, Tier2Checkpoint,
+    TransitionReason, VersionDrift, acp_capabilities, antigravity_capabilities, codex_capabilities, command_name,
+    rehydrate, slash_command_name, version_drift,
 };
 pub use capability::{
     BlockSet, Capabilities, CapabilityTier, CommandSet, ModeInfo, ModelInfo, PromptAcceptedSource, SignalSet,
     SlashCommandInfo, block_kind_name,
 };
 pub use error::SessionError;
+pub use event::UsageBreakdown;
 pub use event::{
     CancelReason, CheckpointEntry, EventClass, ExitStatusLite, FinalizedMessage, ItemKind, NoticeLevel, Outcome,
     PermissionKind, PersistTier, PlanEntry, PlanPriority, PlanStatus, ProvisioningPhase, SessionEvent, StopReason,
-    SubagentKind, SubagentStatus, ToolResultContent, TruncationInfo, TruncationKind, TurnOutcome, classify,
-    persist_tier,
+    SubagentKind, SubagentStatus, SubagentTaskKind, ToolResultContent, TruncationInfo, TruncationKind, TurnOutcome,
+    classify, persist_tier,
 };
 pub use reducer::{Transition, crash_outcome, step};
 pub use state::{

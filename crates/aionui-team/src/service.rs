@@ -3,26 +3,33 @@ mod response_builder;
 pub(crate) mod spawn_support;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::{Arc, Weak};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock, Weak};
 
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
+use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
-    AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamAgentResponse, TeamAgentRuntimeStatus,
-    TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus,
-    TeamSessionStatusPayload, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
+    AddAgentRequest, CreateTeamRequest, GetConfigOptionsResponse, TeamActivityCursor, TeamActivityPageResponse,
+    TeamAgentResponse, TeamAgentRuntimeStatus, TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse,
+    TeamRunStateResponse, TeamSessionBinding, TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload,
+    TeamTaskResponse, TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload,
     TeamToolTransport, WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
 use aionui_db::{
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository, IProviderRepository,
-    ITeamRepository, UpdateTeamParams,
+    ActivityCursor, IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
+    IProviderRepository, ITeamRepository, PageDirection, UpdateTeamParams,
 };
+use aionui_project::{ProjectService, canonical};
 use aionui_realtime::EventBroadcaster;
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
 
+use crate::activity_mapping::{
+    mailbox_row_to_response, message_row_to_activity_item, sort_activity_items, task_row_to_activity_item,
+    task_to_response,
+};
 use crate::error::TeamError;
 use crate::event_loop::{AgentLoopContext, EventLoopRegistrationError};
 use crate::events::{
@@ -32,7 +39,10 @@ use crate::member_runtime::{
     AttachLease, AttachOutcome, AttachWaiter, BeginRemove, MemberRuntimeFailure, MemberRuntimeSnapshot, ReserveAttach,
 };
 use crate::message_projection::TeamProjectionMessageStore;
-use crate::ports::{AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogPort};
+use crate::ports::{
+    AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, NoopNativeSlashCommandPort,
+    TeamAssistantCatalogPort,
+};
 use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
 use crate::runtime_tools::{
@@ -40,9 +50,28 @@ use crate::runtime_tools::{
 };
 use crate::session::{AgentMessageQueueResult, TeamSession, attach_member_runtime, spawn_attach_agent_process_bg};
 use crate::team_run::TeamRunManager;
-use crate::types::{Team, TeamAgent, TeammateRole};
+use crate::types::{Team, TeamAgent, TeamTask, TeammateRole};
 use crate::work_source::WorkSource;
 use crate::workspace::validate_create_workspace_path;
+
+/// Default number of activity items returned when the client omits `limit`.
+pub const DEFAULT_ACTIVITY_LIMIT: i64 = 500;
+/// Hard upper bound for the activity `limit` query parameter.
+pub const MAX_ACTIVITY_LIMIT: i64 = 1000;
+/// Upper bound on how many task ids one dependency-resolution request may
+/// look up, to bound query size regardless of client input.
+pub const MAX_TASK_ID_LOOKUP: usize = 200;
+
+/// Which item kinds the unified activity feed returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityKind {
+    /// Merged messages and tasks.
+    All,
+    /// Messages only.
+    Message,
+    /// Tasks only.
+    Task,
+}
 
 pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &str) {
     if !workspace.trim().is_empty() {
@@ -98,6 +127,9 @@ pub struct TeamSessionService {
     task_manager: Arc<dyn IWorkerTaskManager>,
     turn_port: Arc<dyn AgentTurnExecutionPort>,
     cancellation_port: Arc<dyn AgentTurnCancellationPort>,
+    /// Native slash-command recognizer injected into each `TeamSession`
+    /// (ELECTRON-3RN). No-op by default (see `NoopNativeSlashCommandPort`).
+    slash_command_port: Arc<dyn NativeSlashCommandPort>,
     backend_binary_path: Arc<PathBuf>,
     prompt_dump: TeamPromptDumpConfig,
     sessions: Arc<DashMap<String, SessionEntry>>,
@@ -108,6 +140,9 @@ pub struct TeamSessionService {
     /// Per-team mutex serializing `ensure_session` so concurrent callers cannot
     /// race and start two sessions for the same team.
     ensure_session_locks: Arc<DashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Project-bind side branch (optional). `None` → team binding is a no-op,
+    /// so team create/read behaves exactly as before.
+    project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
     /// Back-pointer used by [`TeamSession::spawn_agent`] to reach DB-facing
     /// orchestration without threading the service through every session method.
     /// Stored as `Weak` so the session map does not create a strong cycle with
@@ -146,6 +181,7 @@ impl TeamSessionService {
             task_manager,
             turn_port,
             cancellation_port,
+            Arc::new(NoopNativeSlashCommandPort),
             backend_binary_path,
             TeamPromptDumpConfig::disabled(),
         )
@@ -165,6 +201,7 @@ impl TeamSessionService {
         task_manager: Arc<dyn IWorkerTaskManager>,
         turn_port: Arc<dyn AgentTurnExecutionPort>,
         cancellation_port: Arc<dyn AgentTurnCancellationPort>,
+        slash_command_port: Arc<dyn NativeSlashCommandPort>,
         backend_binary_path: Arc<PathBuf>,
         prompt_dump: TeamPromptDumpConfig,
     ) -> Arc<Self> {
@@ -181,11 +218,13 @@ impl TeamSessionService {
             task_manager,
             turn_port,
             cancellation_port,
+            slash_command_port,
             backend_binary_path,
             prompt_dump,
             sessions: Arc::new(DashMap::new()),
             add_agent_locks: Arc::new(DashMap::new()),
             ensure_session_locks: Arc::new(DashMap::new()),
+            project_service: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
         })
     }
@@ -200,18 +239,242 @@ impl TeamSessionService {
         )
     }
 
+    /// Inject the project-bind service (project-bind side branch). When unset,
+    /// binding/backfill are no-ops.
+    pub fn with_project_service(&self, project_service: Arc<ProjectService>) {
+        if let Ok(mut guard) = self.project_service.write() {
+            *guard = Some(project_service);
+        }
+    }
+
+    /// Resolve a team workspace into `(project_id, folder_id)`. Best-effort:
+    /// missing service / empty workspace / bad URI / resolve error → `(None, None)`,
+    /// logged at `warn`. Never affects team create/read.
+    async fn resolve_binding_best_effort(&self, user_id: &str, workspace: &str) -> (Option<String>, Option<String>) {
+        let project_service = self.project_service.read().ok().and_then(|guard| guard.clone());
+        let Some(project_service) = project_service else {
+            return (None, None);
+        };
+        if workspace.trim().is_empty() {
+            return (None, None);
+        }
+        let uri = match canonical::to_file_uri(Path::new(workspace)) {
+            Ok(uri) => uri,
+            Err(err) => {
+                warn!(error = err.code(), "team project bind skipped: bad workspace uri");
+                return (None, None);
+            }
+        };
+        match project_service.resolve_existing(user_id, uri).await {
+            Ok(out) => (Some(out.project.project_id), Some(out.folder.folder_id)),
+            Err(err) => {
+                warn!(error = err.code(), "team project bind skipped");
+                (None, None)
+            }
+        }
+    }
+
+    /// Lazily backfill `teams.project_id`/`folder_id` on read. Best-effort;
+    /// no-op when already bound, workspace empty, or service unset.
+    async fn backfill_team_binding_best_effort(&self, row: &TeamRow) {
+        if row.project_id.is_some() || row.workspace.trim().is_empty() {
+            return;
+        }
+        let (Some(project_id), Some(folder_id)) = self.resolve_binding_best_effort(&row.user_id, &row.workspace).await
+        else {
+            return;
+        };
+        let params = UpdateTeamParams {
+            project_id: Some(project_id),
+            folder_id: Some(folder_id),
+            ..Default::default()
+        };
+        if let Err(err) = self.repo.update_team(&row.user_id, &row.id, &params).await {
+            warn!(team_id = %row.id, error = %err, "team project bind: backfill update failed");
+        }
+    }
+
     async fn load_owned_team(&self, user_id: &str, team_id: &str) -> Result<Team, TeamError> {
+        let row = self.load_owned_team_row(user_id, team_id).await?;
+        Ok(Team::from_row(&row)?)
+    }
+
+    async fn load_owned_team_row(&self, user_id: &str, team_id: &str) -> Result<TeamRow, TeamError> {
+        self.repo
+            .get_team(user_id, team_id)
+            .await?
+            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))
+    }
+
+    pub(crate) async fn team_owner_user_id(&self, team_id: &str) -> Result<String, TeamError> {
         let row = self
             .repo
-            .get_team(team_id)
+            .get_team_for_restore(team_id)
             .await?
             .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
-        if row.user_id != user_id {
-            return Err(TeamError::Forbidden(format!(
-                "team {team_id} is not owned by current user"
-            )));
+        Ok(row.user_id)
+    }
+
+    /// Returns the most recent team-wide mailbox messages (all recipients),
+    /// newest first, for the read-only activity view. `limit` is clamped to
+    /// `[1, MAX_ACTIVITY_LIMIT]`. Ownership is enforced first via a scoped
+    /// lookup: a missing team and another user's team both surface as
+    /// `TeamNotFound`, so team existence is never leaked across users.
+    pub async fn list_team_mailbox(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TeamMailboxMessageResponse>, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let clamped = limit.clamp(1, MAX_ACTIVITY_LIMIT);
+        let rows = self.repo.list_messages_by_team(team_id, clamped).await?;
+        let responses: Vec<TeamMailboxMessageResponse> = rows.iter().map(mailbox_row_to_response).collect();
+        info!(kind = "team", team_id, count = responses.len(), "team mailbox listed");
+        Ok(responses)
+    }
+
+    /// Returns the team's tasks, newest first (`created_at` DESC, `id` as a
+    /// stable secondary key), truncated to a clamped `limit`, for the
+    /// read-only activity view. Reuses the existing ASC `list_tasks` and sorts
+    /// in the service. Ownership is enforced first.
+    pub async fn list_team_tasks(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        limit: i64,
+    ) -> Result<Vec<TeamTaskResponse>, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let clamped = limit.clamp(1, MAX_ACTIVITY_LIMIT);
+        let rows = self.repo.list_tasks(user_id, team_id).await?;
+        let mut tasks: Vec<TeamTask> = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
+        tasks.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+        tasks.truncate(clamped as usize);
+        let responses: Vec<TeamTaskResponse> = tasks.iter().map(task_to_response).collect();
+        info!(kind = "team", team_id, count = responses.len(), "team tasks listed");
+        Ok(responses)
+    }
+
+    /// Returns the team's tasks matching `ids` (newest first), for resolving
+    /// dependency (`blocked_by`) subjects that may lie outside the loaded
+    /// activity page. Ownership is enforced first; `ids` is clamped to
+    /// `MAX_TASK_ID_LOOKUP`. An empty `ids` yields an empty result.
+    pub async fn list_team_tasks_by_ids(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<TeamTaskResponse>, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        if ids.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(Team::from_row(&row)?)
+        let capped = &ids[..ids.len().min(MAX_TASK_ID_LOOKUP)];
+        let rows = self.repo.list_tasks_by_ids(user_id, team_id, capped).await?;
+        let tasks: Vec<TeamTask> = rows.iter().filter_map(|r| TeamTask::from_row(r).ok()).collect();
+        let responses: Vec<TeamTaskResponse> = tasks.iter().map(task_to_response).collect();
+        info!(
+            kind = "team",
+            team_id,
+            count = responses.len(),
+            "team tasks resolved by ids"
+        );
+        Ok(responses)
+    }
+
+    /// Returns one keyset-paginated page of the unified activity feed (messages
+    /// and/or tasks per `kind`), ordered by `(created_at, id)` in `direction`.
+    /// Ownership is enforced first, so another user's team is indistinguishable
+    /// from a missing one (`TeamNotFound`). For `kind = All`, each stream is
+    /// fetched up to `limit` rows and merged; the global top-`limit` is
+    /// mathematically complete (any item newer/older than the cursor is within
+    /// its own stream's top-`limit`). `has_more` is conservative: a full sub-
+    /// query or a post-merge truncation both flag "possibly more".
+    pub async fn list_team_activity(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        cursor: Option<ActivityCursor>,
+        direction: PageDirection,
+        kind: ActivityKind,
+        limit: i64,
+    ) -> Result<TeamActivityPageResponse, TeamError> {
+        self.load_owned_team(user_id, team_id).await?;
+        let limit = limit.clamp(1, MAX_ACTIVITY_LIMIT);
+
+        let (mut items, mailbox_full, tasks_full) = match kind {
+            ActivityKind::Message => {
+                let rows = self
+                    .repo
+                    .list_messages_by_team_paged(team_id, cursor.clone(), direction, limit)
+                    .await?;
+                let full = rows.len() as i64 == limit;
+                (
+                    rows.iter().map(message_row_to_activity_item).collect::<Vec<_>>(),
+                    full,
+                    false,
+                )
+            }
+            ActivityKind::Task => {
+                let rows = self
+                    .repo
+                    .list_tasks_paged(user_id, team_id, cursor.clone(), direction, limit)
+                    .await?;
+                let full = rows.len() as i64 == limit;
+                (
+                    rows.iter().filter_map(task_row_to_activity_item).collect::<Vec<_>>(),
+                    false,
+                    full,
+                )
+            }
+            ActivityKind::All => {
+                let msgs = self
+                    .repo
+                    .list_messages_by_team_paged(team_id, cursor.clone(), direction, limit)
+                    .await?;
+                let tasks = self
+                    .repo
+                    .list_tasks_paged(user_id, team_id, cursor.clone(), direction, limit)
+                    .await?;
+                let mailbox_full = msgs.len() as i64 == limit;
+                let tasks_full = tasks.len() as i64 == limit;
+                let mut merged: Vec<_> = msgs
+                    .iter()
+                    .map(message_row_to_activity_item)
+                    .chain(tasks.iter().filter_map(task_row_to_activity_item))
+                    .collect();
+                sort_activity_items(&mut merged, direction);
+                (merged, mailbox_full, tasks_full)
+            }
+        };
+
+        // Truncate to the top `limit`; whether we cut anything feeds `has_more`.
+        let truncated = items.len() as i64 > limit;
+        items.truncate(limit as usize);
+
+        let has_more = mailbox_full || tasks_full || truncated;
+        let next_cursor = if has_more {
+            items.last().map(|i| TeamActivityCursor {
+                ts: i.created_at,
+                id: i.id.clone(),
+            })
+        } else {
+            None
+        };
+
+        info!(
+            kind = "team",
+            team_id,
+            count = items.len(),
+            first_page = cursor.is_none(),
+            "team activity listed"
+        );
+
+        Ok(TeamActivityPageResponse {
+            items,
+            next_cursor,
+            has_more,
+        })
     }
 
     pub async fn renew_active_lease(
@@ -220,9 +483,14 @@ impl TeamSessionService {
         team_id: &str,
         active_leases: &ActiveLeaseRegistry,
     ) -> Result<(), TeamError> {
-        let team = match self.load_owned_team(user_id, team_id).await {
+        let team = match self.repo.get_team(user_id, team_id).await {
+            Ok(Some(row)) => Team::from_row(&row).map_err(TeamError::from),
+            Ok(None) => Err(TeamError::TeamNotFound(team_id.to_owned())),
+            Err(error) => Err(TeamError::Database(error)),
+        };
+        let team = match team {
             Ok(team) => team,
-            Err(error @ (TeamError::TeamNotFound(_) | TeamError::Forbidden(_))) => {
+            Err(error @ TeamError::TeamNotFound(_)) => {
                 debug!(
                     kind = "team",
                     team_id,
@@ -261,7 +529,7 @@ impl TeamSessionService {
     /// Restore sessions for all existing teams. Called once at app startup
     /// so that MCP servers are available before any user sends a message.
     pub async fn restore_all_sessions(&self) {
-        let teams = match self.repo.list_teams().await {
+        let teams = match self.repo.list_teams_for_restore().await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to list teams for session restore");
@@ -269,7 +537,7 @@ impl TeamSessionService {
             }
         };
         for team in &teams {
-            if let Err(e) = self.ensure_session_inner(&team.id).await {
+            if let Err(e) = self.ensure_session_inner(&team.id, None).await {
                 tracing::warn!(team_id = %team.id, error = %e, "failed to restore session on startup");
                 continue;
             }
@@ -311,6 +579,9 @@ impl TeamSessionService {
         let team_workspace = provisioned.team_workspace;
         let agents_json = serde_json::to_string(&agents)?;
 
+        // Project-bind side branch (best-effort; never affects team creation).
+        let (project_id, folder_id) = self.resolve_binding_best_effort(user_id, &team_workspace).await;
+
         let row = TeamRow {
             id: team_id.clone(),
             user_id: user_id.to_owned(),
@@ -323,6 +594,8 @@ impl TeamSessionService {
             agents_version: "1.0.1".into(),
             created_at: now,
             updated_at: now,
+            project_id,
+            folder_id,
         };
         self.repo.create_team(&row).await?;
 
@@ -347,9 +620,9 @@ impl TeamSessionService {
             "Team created"
         );
 
-        self.broadcast_team_created(&team.id, &team.name);
+        self.broadcast_team_created(user_id, &team.id, &team.name);
 
-        self.build_team_response(&team).await
+        self.build_team_response(user_id, &team).await
     }
 
     pub async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamResponse>, TeamError> {
@@ -357,7 +630,7 @@ impl TeamSessionService {
         let mut teams = Vec::with_capacity(rows.len());
         for row in &rows {
             match Team::from_row(row) {
-                Ok(team) => match self.build_team_response(&team).await {
+                Ok(team) => match self.build_team_response(user_id, &team).await {
                     Ok(resp) => teams.push(resp),
                     Err(e) => {
                         tracing::warn!(team_id = %row.id, error = %e, "skipping team with build error");
@@ -372,8 +645,12 @@ impl TeamSessionService {
     }
 
     pub async fn get_team(&self, user_id: &str, team_id: &str) -> Result<TeamResponse, TeamError> {
-        let team = self.load_owned_team(user_id, team_id).await?;
-        self.build_team_response(&team).await
+        let row = self.load_owned_team_row(user_id, team_id).await?;
+        // Project-bind side branch: lazily backfill binding only when a single
+        // team is opened (never during list_teams / lease renew).
+        self.backfill_team_binding_best_effort(&row).await;
+        let team = Team::from_row(&row)?;
+        self.build_team_response(user_id, &team).await
     }
 
     pub async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
@@ -403,14 +680,14 @@ impl TeamSessionService {
                 .await;
         }
 
-        self.repo.delete_mailbox_by_team(team_id).await?;
-        self.repo.delete_tasks_by_team(team_id).await?;
-        self.repo.delete_team(team_id).await?;
+        self.repo.delete_mailbox_by_team(user_id, team_id).await?;
+        self.repo.delete_tasks_by_team(user_id, team_id).await?;
+        self.repo.delete_team(user_id, team_id).await?;
 
         self.add_agent_locks.remove(team_id);
 
         info!(team_id = %team_id, "Team removed");
-        self.broadcast_team_removed(team_id);
+        self.broadcast_team_removed(user_id, team_id);
         Ok(())
     }
 
@@ -419,6 +696,7 @@ impl TeamSessionService {
 
         self.repo
             .update_team(
+                user_id,
                 team_id,
                 &UpdateTeamParams {
                     name: Some(name.to_owned()),
@@ -426,7 +704,7 @@ impl TeamSessionService {
                 },
             )
             .await?;
-        self.broadcast_team_renamed(team_id, name);
+        self.broadcast_team_renamed(user_id, team_id, name);
         Ok(())
     }
 
@@ -443,16 +721,7 @@ impl TeamSessionService {
             .clone();
         let _guard = lock.lock().await;
 
-        let row = self
-            .repo
-            .get_team(team_id)
-            .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.into()))?;
-        if row.user_id != user_id {
-            return Err(TeamError::Forbidden(format!(
-                "team {team_id} is not owned by current user"
-            )));
-        }
+        let row = self.load_owned_team_row(user_id, team_id).await?;
         let mut team = Team::from_row(&row)?;
         let agent = self.provisioner().add_agent(user_id, &row, &mut team, req).await?;
 
@@ -463,7 +732,7 @@ impl TeamSessionService {
                 .self_ref
                 .upgrade()
                 .ok_or_else(|| TeamError::InvalidRequest("add_agent requires a live TeamSessionService".into()))?;
-            self.broadcast_agent_runtime_status(team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
+            self.broadcast_agent_runtime_status(user_id, team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
             spawn_attach_agent_process_bg(
                 service,
                 session,
@@ -484,7 +753,8 @@ impl TeamSessionService {
                 "manual teammate added"
             );
         } else {
-            TeamEventEmitter::new(team_id.to_owned(), self.broadcaster.clone()).broadcast_agent_spawned(&agent);
+            TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone())
+                .broadcast_agent_spawned(&agent);
             info!(
                 team_id = %team_id,
                 slot_id = %agent.slot_id,
@@ -496,7 +766,7 @@ impl TeamSessionService {
             );
         }
 
-        self.build_agent_response(&agent).await
+        self.build_agent_response(user_id, &agent).await
     }
 
     pub async fn remove_agent(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
@@ -560,6 +830,7 @@ impl TeamSessionService {
             let agents_json = serde_json::to_string(&current.agents)?;
             self.repo
                 .update_team(
+                    user_id,
                     team_id,
                     &UpdateTeamParams {
                         agents: Some(agents_json),
@@ -642,7 +913,8 @@ impl TeamSessionService {
                 "manual teammate removed"
             );
         } else {
-            TeamEventEmitter::new(team_id.to_owned(), self.broadcaster.clone()).broadcast_agent_removed(slot_id);
+            TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone())
+                .broadcast_agent_removed(slot_id);
             info!(
                 team_id = %team_id,
                 slot_id = %removed.slot_id,
@@ -693,6 +965,7 @@ impl TeamSessionService {
         let agents_json = serde_json::to_string(&team.agents)?;
         self.repo
             .update_team(
+                user_id,
                 team_id,
                 &UpdateTeamParams {
                     agents: Some(agents_json),
@@ -723,19 +996,11 @@ impl TeamSessionService {
     ///    any failure, stop the session and leave the map untouched so a
     ///    retry can start cleanly.
     pub async fn ensure_session(&self, user_id: &str, team_id: &str) -> Result<(), TeamError> {
-        let row = match self.repo.get_team(team_id).await {
-            Ok(Some(row)) => row,
-            Ok(None) | Err(_) => return self.ensure_session_inner(team_id).await,
-        };
-        if row.user_id != user_id {
-            return Err(TeamError::Forbidden(format!(
-                "team {team_id} is not owned by current user"
-            )));
-        }
-        self.ensure_session_inner(team_id).await
+        self.load_owned_team_row(user_id, team_id).await?;
+        self.ensure_session_inner(team_id, Some(user_id)).await
     }
 
-    async fn ensure_session_inner(&self, team_id: &str) -> Result<(), TeamError> {
+    async fn ensure_session_inner(&self, team_id: &str, requested_user_id: Option<&str>) -> Result<(), TeamError> {
         let membership_lock = self
             .add_agent_locks
             .entry(team_id.to_owned())
@@ -743,28 +1008,34 @@ impl TeamSessionService {
             .clone();
         let membership_guard = membership_lock.lock().await;
 
-        let row = match self.repo.get_team(team_id).await {
+        let row = match self.repo.get_team_for_restore(team_id).await {
             Ok(Some(row)) => row,
             Ok(None) => {
-                self.broadcast_session_status(
-                    team_id,
-                    TeamSessionStatus::Failed,
-                    Some(TeamSessionPhase::LoadingTeam),
-                    |p| {
-                        p.error = Some(format!("team not found: {team_id}"));
-                    },
-                );
+                if let Some(user_id) = requested_user_id {
+                    self.broadcast_session_status(
+                        user_id,
+                        team_id,
+                        TeamSessionStatus::Failed,
+                        Some(TeamSessionPhase::LoadingTeam),
+                        |p| {
+                            p.error = Some(format!("team not found: {team_id}"));
+                        },
+                    );
+                }
                 return Err(TeamError::TeamNotFound(team_id.into()));
             }
             Err(e) => {
-                self.broadcast_session_status(
-                    team_id,
-                    TeamSessionStatus::Failed,
-                    Some(TeamSessionPhase::LoadingTeam),
-                    |p| {
-                        p.error = Some(e.to_string());
-                    },
-                );
+                if let Some(user_id) = requested_user_id {
+                    self.broadcast_session_status(
+                        user_id,
+                        team_id,
+                        TeamSessionStatus::Failed,
+                        Some(TeamSessionPhase::LoadingTeam),
+                        |p| {
+                            p.error = Some(e.to_string());
+                        },
+                    );
+                }
                 return Err(e.into());
             }
         };
@@ -801,6 +1072,7 @@ impl TeamSessionService {
         }
 
         self.broadcast_session_status(
+            &user_id,
             team_id,
             TeamSessionStatus::Starting,
             Some(TeamSessionPhase::LoadingTeam),
@@ -808,6 +1080,7 @@ impl TeamSessionService {
         );
 
         self.broadcast_session_status(
+            &user_id,
             team_id,
             TeamSessionStatus::Starting,
             Some(TeamSessionPhase::StartingBridge),
@@ -829,9 +1102,10 @@ impl TeamSessionService {
         )
         .await
         {
-            Ok(session) => Arc::new(session),
+            Ok(session) => Arc::new(session.with_slash_command_port(self.slash_command_port.clone())),
             Err(e) => {
                 self.broadcast_session_status(
+                    &user_id,
                     team_id,
                     TeamSessionStatus::Failed,
                     Some(TeamSessionPhase::StartingBridge),
@@ -844,6 +1118,7 @@ impl TeamSessionService {
         };
 
         self.broadcast_session_status(
+            &user_id,
             team_id,
             TeamSessionStatus::Starting,
             Some(TeamSessionPhase::AttachingAgents),
@@ -865,6 +1140,7 @@ impl TeamSessionService {
         else {
             let error = TeamError::InvalidRequest("team has no lead agent".to_owned());
             self.broadcast_session_status(
+                &user_id,
                 team_id,
                 TeamSessionStatus::Failed,
                 Some(TeamSessionPhase::AttachingAgents),
@@ -891,7 +1167,7 @@ impl TeamSessionService {
         drop(membership_guard);
         drop(ensure_guard);
 
-        self.broadcast_agent_runtime_status(team_id, &leader, TeamAgentRuntimeStatus::Pending, None);
+        self.broadcast_agent_runtime_status(&user_id, team_id, &leader, TeamAgentRuntimeStatus::Pending, None);
         let leader_outcome = match session.member_runtimes().reserve_attach(&leader.slot_id, false) {
             ReserveAttach::Start(lease) => {
                 attach_member_runtime(
@@ -916,6 +1192,7 @@ impl TeamSessionService {
             AttachOutcome::Ready | AttachOutcome::Removed => {}
             AttachOutcome::Failed(failure) => {
                 self.broadcast_session_status(
+                    &user_id,
                     team_id,
                     TeamSessionStatus::Failed,
                     Some(TeamSessionPhase::AttachingAgents),
@@ -942,10 +1219,11 @@ impl TeamSessionService {
         // Teammates start dormant; the leader's Ready was already broadcast by
         // its successful attach.
         for agent in agents_snapshot.iter().filter(|a| a.role != TeammateRole::Lead) {
-            self.broadcast_agent_runtime_status(team_id, agent, TeamAgentRuntimeStatus::Dormant, None);
+            self.broadcast_agent_runtime_status(&user_id, team_id, agent, TeamAgentRuntimeStatus::Dormant, None);
         }
 
         self.broadcast_session_status(
+            &user_id,
             team_id,
             TeamSessionStatus::Starting,
             Some(TeamSessionPhase::Recovering),
@@ -960,7 +1238,7 @@ impl TeamSessionService {
             );
         }
 
-        self.broadcast_session_status(team_id, TeamSessionStatus::Ready, None, |p| {
+        self.broadcast_session_status(&user_id, team_id, TeamSessionStatus::Ready, None, |p| {
             p.server_count = Some(agents_snapshot.len());
         });
 
@@ -1005,6 +1283,7 @@ impl TeamSessionService {
             match reservation {
                 ReserveAttach::Start(owner) => {
                     self.broadcast_agent_runtime_status(
+                        session.user_id(),
                         session.team_id(),
                         agent,
                         TeamAgentRuntimeStatus::Pending,
@@ -1092,7 +1371,7 @@ impl TeamSessionService {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _membership_guard = membership_lock.lock().await;
-        let current_agents = match self.repo.get_team(team_id).await? {
+        let current_agents = match self.repo.get_team(user_id, team_id).await? {
             Some(row) => Team::from_row(&row)?.agents,
             None => return Err(TeamError::TeamNotFound(team_id.to_owned())),
         };
@@ -1125,6 +1404,7 @@ impl TeamSessionService {
                     // must not fail just because an unrelated teammate is broken.
                     if agent.role == TeammateRole::Lead {
                         self.broadcast_session_status(
+                            user_id,
                             team_id,
                             TeamSessionStatus::Failed,
                             Some(TeamSessionPhase::AttachingAgents),
@@ -1146,7 +1426,7 @@ impl TeamSessionService {
             }
         }
 
-        self.broadcast_session_status(team_id, TeamSessionStatus::Ready, None, |payload| {
+        self.broadcast_session_status(user_id, team_id, TeamSessionStatus::Ready, None, |payload| {
             payload.server_count = Some(current_agents.len());
         });
         Ok(())
@@ -1181,16 +1461,7 @@ impl TeamSessionService {
         team_id: &str,
         conversation_id: &str,
     ) -> Result<GetConfigOptionsResponse, TeamError> {
-        let row = self
-            .repo
-            .get_team(team_id)
-            .await?
-            .ok_or_else(|| TeamError::TeamNotFound(team_id.to_owned()))?;
-        if row.user_id != user_id {
-            return Err(TeamError::Forbidden(format!(
-                "team {team_id} is not owned by current user"
-            )));
-        }
+        let row = self.load_owned_team_row(user_id, team_id).await?;
 
         let team = Team::from_row(&row)?;
         let member = team.agents.iter().any(|agent| agent.conversation_id == conversation_id);
@@ -1203,6 +1474,7 @@ impl TeamSessionService {
 
     fn broadcast_session_status<F>(
         &self,
+        user_id: &str,
         team_id: &str,
         status: TeamSessionStatus,
         phase: Option<TeamSessionPhase>,
@@ -1230,10 +1502,11 @@ impl TeamSessionService {
             error = payload.error.as_deref().unwrap_or(""),
             "team session status broadcast"
         );
-        let event = WebSocketMessage::new(
-            TEAM_SESSION_STATUS_CHANGED_EVENT,
-            serde_json::to_value(payload).expect("serialize team session status payload"),
-        );
+        // Keep per-user scoping so the overlay event reaches only the owning
+        // user's WebSocket subscribers.
+        let mut value = serde_json::to_value(payload).expect("serialize team session status payload");
+        value["user_id"] = serde_json::Value::String(user_id.to_owned());
+        let event = WebSocketMessage::new(TEAM_SESSION_STATUS_CHANGED_EVENT, value);
         self.broadcaster.broadcast(event);
     }
 
@@ -1249,49 +1522,50 @@ impl TeamSessionService {
         })
     }
 
-    fn broadcast_team_created(&self, team_id: &str, team_name: &str) {
+    fn broadcast_team_created(&self, user_id: &str, team_id: &str, team_name: &str) {
         info!(team_id = %team_id, event_name = TEAM_CREATED_EVENT, "team event broadcast");
         self.broadcaster.broadcast(WebSocketMessage::new(
             TEAM_CREATED_EVENT,
-            serde_json::json!({ "team_id": team_id, "team_name": team_name }),
+            serde_json::json!({ "user_id": user_id, "team_id": team_id, "team_name": team_name }),
         ));
-        self.broadcast_team_list_changed(team_id, "created");
+        self.broadcast_team_list_changed(user_id, team_id, "created");
     }
 
-    fn broadcast_team_removed(&self, team_id: &str) {
+    fn broadcast_team_removed(&self, user_id: &str, team_id: &str) {
         info!(team_id = %team_id, event_name = TEAM_REMOVED_EVENT, "team event broadcast");
         self.broadcaster.broadcast(WebSocketMessage::new(
             TEAM_REMOVED_EVENT,
-            serde_json::json!({ "team_id": team_id }),
+            serde_json::json!({ "user_id": user_id, "team_id": team_id }),
         ));
-        self.broadcast_team_list_changed(team_id, "removed");
+        self.broadcast_team_list_changed(user_id, team_id, "removed");
     }
 
-    fn broadcast_team_renamed(&self, team_id: &str, team_name: &str) {
+    fn broadcast_team_renamed(&self, user_id: &str, team_id: &str, team_name: &str) {
         info!(team_id = %team_id, event_name = TEAM_RENAMED_EVENT, "team event broadcast");
         self.broadcaster.broadcast(WebSocketMessage::new(
             TEAM_RENAMED_EVENT,
-            serde_json::json!({ "team_id": team_id, "team_name": team_name }),
+            serde_json::json!({ "user_id": user_id, "team_id": team_id, "team_name": team_name }),
         ));
-        self.broadcast_team_list_changed(team_id, "renamed");
+        self.broadcast_team_list_changed(user_id, team_id, "renamed");
     }
 
-    fn broadcast_team_list_changed(&self, team_id: &str, action: &str) {
+    fn broadcast_team_list_changed(&self, user_id: &str, team_id: &str, action: &str) {
         info!(team_id = %team_id, event_name = crate::events::TEAM_LIST_CHANGED_EVENT, action, "team event broadcast");
         self.broadcaster.broadcast(WebSocketMessage::new(
             crate::events::TEAM_LIST_CHANGED_EVENT,
-            serde_json::json!({ "team_id": team_id, "action": action }),
+            serde_json::json!({ "user_id": user_id, "team_id": team_id, "action": action }),
         ));
     }
 
     pub(crate) fn broadcast_agent_runtime_status(
         &self,
+        user_id: &str,
         team_id: &str,
         agent: &TeamAgent,
         status: TeamAgentRuntimeStatus,
         error: Option<String>,
     ) {
-        TeamEventEmitter::new(team_id.to_owned(), self.broadcaster.clone())
+        TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone())
             .broadcast_agent_runtime_status(agent, status, error);
     }
 
@@ -1356,7 +1630,13 @@ impl TeamSessionService {
 
     pub(crate) fn publish_member_runtime_ready_if_current(&self, expected: &TeamSession, agent: &TeamAgent) -> bool {
         self.with_published_session(expected, |_| {
-            self.broadcast_agent_runtime_status(expected.team_id(), agent, TeamAgentRuntimeStatus::Ready, None);
+            self.broadcast_agent_runtime_status(
+                expected.user_id(),
+                expected.team_id(),
+                agent,
+                TeamAgentRuntimeStatus::Ready,
+                None,
+            );
         })
         .is_some()
     }
@@ -1364,6 +1644,7 @@ impl TeamSessionService {
     pub(crate) fn publish_member_runtime_starting_if_current(&self, expected: &TeamSession) -> bool {
         self.with_published_session(expected, |_| {
             self.broadcast_session_status(
+                expected.user_id(),
                 expected.team_id(),
                 TeamSessionStatus::Starting,
                 Some(TeamSessionPhase::AttachingAgents),
@@ -1376,6 +1657,7 @@ impl TeamSessionService {
     pub(crate) fn publish_member_runtime_failed_if_current(&self, expected: &TeamSession, reason: &str) -> bool {
         self.with_published_session(expected, |_| {
             self.broadcast_session_status(
+                expected.user_id(),
                 expected.team_id(),
                 TeamSessionStatus::Failed,
                 Some(TeamSessionPhase::AttachingAgents),
@@ -1392,7 +1674,7 @@ impl TeamSessionService {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _membership_guard = membership_lock.lock().await;
-        let Ok(Some(row)) = self.repo.get_team(expected.team_id()).await else {
+        let Ok(Some(row)) = self.repo.get_team(expected.user_id(), expected.team_id()).await else {
             return;
         };
         let Ok(team) = Team::from_row(&row) else {
@@ -1415,9 +1697,15 @@ impl TeamSessionService {
         match expected.member_runtimes().snapshot(&leader.slot_id) {
             MemberRuntimeSnapshot::Ready => {
                 let _ = self.with_published_session(expected, |_| {
-                    self.broadcast_session_status(expected.team_id(), TeamSessionStatus::Ready, None, |payload| {
-                        payload.server_count = Some(team.agents.len());
-                    });
+                    self.broadcast_session_status(
+                        expected.user_id(),
+                        expected.team_id(),
+                        TeamSessionStatus::Ready,
+                        None,
+                        |payload| {
+                            payload.server_count = Some(team.agents.len());
+                        },
+                    );
                 });
             }
             MemberRuntimeSnapshot::Failed { failure, .. } => {
@@ -1513,16 +1801,10 @@ impl TeamSessionService {
 
         let team_row = self
             .repo
-            .get_team(&team_id)
+            .get_team(user_id, &team_id)
             .await
             .map_err(|error| error_payload(TeamToolErrorCode::RuntimeContextMissing, error.to_string()))?
             .ok_or_else(|| error_payload(TeamToolErrorCode::TeamNotFound, "team not found"))?;
-        if team_row.user_id != user_id {
-            return Err(error_payload(
-                TeamToolErrorCode::PermissionDenied,
-                "team does not belong to user",
-            ));
-        }
 
         let binding = TeamSessionBinding {
             team_id: team_id.clone(),
@@ -1590,6 +1872,20 @@ impl TeamSessionService {
         self.load_owned_team(user_id, team_id).await?;
         self.stop_session_unchecked(team_id);
         Ok(())
+    }
+
+    pub fn stop_sessions_for_user(&self, user_id: &str) -> usize {
+        let team_ids: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|entry| entry.session.user_id() == user_id)
+            .map(|entry| entry.key().clone())
+            .collect();
+        let stopped = team_ids.len();
+        for team_id in team_ids {
+            self.stop_session_unchecked(&team_id);
+        }
+        stopped
     }
 
     fn stop_session_unchecked(&self, team_id: &str) {
@@ -1673,7 +1969,15 @@ impl TeamSessionService {
                 "team idle cleanup stopping idle team session"
             );
             info!(team_id, reason = "idle_cleanup", "broadcasting team session stopped");
-            self.broadcast_session_status(&team_id, TeamSessionStatus::Stopped, None, |_| {});
+            if let Some(entry) = self.sessions.get(&team_id) {
+                self.broadcast_session_status(
+                    entry.session.user_id(),
+                    &team_id,
+                    TeamSessionStatus::Stopped,
+                    None,
+                    |_| {},
+                );
+            }
             self.stop_session_unchecked(&team_id);
             for agent in agents {
                 self.task_manager
@@ -1693,10 +1997,11 @@ impl TeamSessionService {
         user_id: &str,
         team_id: &str,
         content: &str,
-        files: Option<Vec<String>>,
+        files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id).await?;
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
+        let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
         let session = {
             let entry = self
                 .sessions
@@ -1704,7 +2009,7 @@ impl TeamSessionService {
                 .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
             Arc::clone(&entry.session)
         };
-        session.send_message(content, files).await
+        session.send_message(&content, files).await
     }
 
     pub async fn send_message_to_agent(
@@ -1713,10 +2018,11 @@ impl TeamSessionService {
         team_id: &str,
         slot_id: &str,
         content: &str,
-        files: Option<Vec<String>>,
+        files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id).await?;
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
+        let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
         let session = {
             let entry = self
                 .sessions
@@ -1724,7 +2030,36 @@ impl TeamSessionService {
                 .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
             Arc::clone(&entry.session)
         };
-        session.send_message_to_agent(slot_id, content, files).await
+        session.send_message_to_agent(slot_id, &content, files).await
+    }
+
+    /// Resolve a send's attachments to absolute paths and re-inline them into
+    /// the content (`[[AION_FILES]]` form) at the team send boundary. Atomic;
+    /// empty/absent `files` is a no-op needing no project service.
+    async fn resolve_message_attachments(
+        &self,
+        user_id: &str,
+        content: &str,
+        files: Option<Vec<ChatFileRef>>,
+    ) -> Result<(String, Option<Vec<String>>), TeamError> {
+        let files = match files {
+            Some(files) if !files.is_empty() => files,
+            _ => return Ok((content.to_owned(), None)),
+        };
+        let project = self
+            .project_service
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or_else(|| {
+                TeamError::InvalidRequest("project service unavailable; cannot resolve file attachments".into())
+            })?;
+        let upload_root = std::env::temp_dir().join("aionui");
+        let resolved = project
+            .resolve_chat_message(user_id, content, &files, &upload_root)
+            .await
+            .map_err(|err| TeamError::InvalidRequest(err.to_string()))?;
+        Ok((resolved.content, Some(resolved.files)))
     }
 
     /// Directed retry/wakeup for a single member runtime (dormant or failed),
@@ -1735,7 +2070,7 @@ impl TeamSessionService {
     /// the member's event loop via `reconcile_mailbox`.
     pub async fn attach_agent_runtime(&self, user_id: &str, team_id: &str, slot_id: &str) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id).await?;
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
             let entry = self
                 .sessions
@@ -1749,7 +2084,7 @@ impl TeamSessionService {
             .upgrade()
             .ok_or_else(|| TeamError::InvalidRequest("team service is shutting down".to_owned()))?;
         let reservation = session.member_runtimes().reserve_attach(slot_id, true);
-        self.broadcast_agent_runtime_status(team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
+        self.broadcast_agent_runtime_status(user_id, team_id, &agent, TeamAgentRuntimeStatus::Pending, None);
         spawn_attach_agent_process_bg(
             service,
             Arc::clone(&session),
@@ -1772,7 +2107,7 @@ impl TeamSessionService {
         reason: Option<String>,
     ) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id).await?;
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
             let entry = self
                 .sessions
@@ -1792,7 +2127,7 @@ impl TeamSessionService {
         reason: Option<String>,
     ) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id).await?;
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
             let entry = self
                 .sessions
@@ -1812,7 +2147,7 @@ impl TeamSessionService {
         reason: Option<String>,
     ) -> Result<(), TeamError> {
         self.load_owned_team(user_id, team_id).await?;
-        self.ensure_session_inner(team_id).await?;
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = {
             let entry = self
                 .sessions
@@ -1828,6 +2163,7 @@ impl TeamSessionService {
         let provisioner = self.provisioner();
         self.repo
             .update_team(
+                user_id,
                 team_id,
                 &UpdateTeamParams {
                     session_mode: Some(mode.to_owned()),
@@ -1875,7 +2211,6 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<AgentMessageQueueResult, TeamError> {
-        self.require_active_team_run_for_team_work(team_id).await?;
         let session = {
             let entry = self
                 .sessions
@@ -1903,23 +2238,6 @@ impl TeamSessionService {
             Arc::clone(&entry.session)
         };
         session.shutdown_agent(caller_slot_id, target_slot_id, reason).await
-    }
-
-    /// Friendly pre-check used before invoking run-scoped team tools. This is
-    /// not a concurrency guarantee; any operation
-    /// that writes mailbox, projection, scheduler, spawn, shutdown, or wake state
-    /// must still acquire a TeamRun operation lease in TeamSession/TeamRunManager.
-    pub(crate) async fn require_active_team_run_for_team_work(&self, team_id: &str) -> Result<(), TeamError> {
-        let entry = self
-            .sessions
-            .get(team_id)
-            .ok_or_else(|| TeamError::SessionNotFound(team_id.into()))?;
-        if entry.session.team_run_manager().current_active_run_id().is_some() {
-            return Ok(());
-        }
-        Err(TeamError::InvalidRequest(
-            "no active team run for run-scoped wake".into(),
-        ))
     }
 
     pub(crate) async fn wake_leader_after_recovery_message(
@@ -2280,6 +2598,29 @@ mod tests {
 
         assert!(svc.session_has_slow_monitor(&created.id));
         svc.stop_session("user-test", &created.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_sessions_for_user_keeps_other_user_sessions() {
+        let (svc, _repo, _task_manager, _conv_repo) = setup_with_factory_metadata_team_repo_and_conversation_repo();
+        let owned = svc
+            .create_team("user-test", single_agent_team_request("Owned Session"))
+            .await
+            .unwrap();
+        let other = svc
+            .create_team("user-other", single_agent_team_request("Other Session"))
+            .await
+            .unwrap();
+
+        svc.ensure_session("user-test", &owned.id).await.unwrap();
+        svc.ensure_session("user-other", &other.id).await.unwrap();
+
+        assert_eq!(svc.stop_sessions_for_user("user-test"), 1);
+        assert_eq!(svc.session_count_for_test(), 1);
+        assert!(!svc.session_has_slow_monitor(&owned.id));
+        assert!(svc.session_has_slow_monitor(&other.id));
+
+        svc.stop_session("user-other", &other.id).await.unwrap();
     }
 
     #[tokio::test]
@@ -2737,7 +3078,11 @@ mod tests {
             .await
             .unwrap();
 
-        let row = repo.get_team(&created.id).await.unwrap().expect("team row");
+        let row = repo
+            .get_team("user-test", &created.id)
+            .await
+            .unwrap()
+            .expect("team row");
         assert_eq!(row.session_mode.as_deref(), Some("full_auto"));
 
         let added = svc
@@ -2787,7 +3132,11 @@ mod tests {
             .create_team("user-test", single_agent_team_request("Partial Mode Seed"))
             .await
             .unwrap();
-        let mut row = repo.get_team(&created.id).await.unwrap().expect("team row");
+        let mut row = repo
+            .get_team("user-test", &created.id)
+            .await
+            .unwrap()
+            .expect("team row");
         row.agents = serde_json::json!([
             {
                 "slot_id": "slot-accepts",
@@ -2810,6 +3159,7 @@ mod tests {
         ])
         .to_string();
         repo.update_team(
+            "user-test",
             &created.id,
             &aionui_db::UpdateTeamParams {
                 agents: Some(row.agents),
@@ -2837,6 +3187,9 @@ mod tests {
                 pinned_at: None,
                 created_at: now_ms(),
                 updated_at: now_ms(),
+                project_id: None,
+                folder_id: None,
+                name_source: None,
             })
             .await
             .unwrap();
@@ -2859,6 +3212,9 @@ mod tests {
                 pinned_at: None,
                 created_at: now_ms(),
                 updated_at: now_ms(),
+                project_id: None,
+                folder_id: None,
+                name_source: None,
             })
             .await
             .unwrap();
@@ -2867,7 +3223,11 @@ mod tests {
             .await
             .unwrap();
 
-        let team = repo.get_team(&created.id).await.unwrap().expect("team row");
+        let team = repo
+            .get_team("user-test", &created.id)
+            .await
+            .unwrap()
+            .expect("team row");
         assert_eq!(team.session_mode.as_deref(), Some("read-only"));
 
         let accepting_extra = conv_repo.get_extra(accepting_conversation_id).unwrap();
@@ -3017,6 +3377,6 @@ mod tests {
             .await
             .expect_err("team config options must reject cross-user access");
 
-        assert!(matches!(err, crate::error::TeamError::Forbidden(_)));
+        assert!(matches!(err, crate::error::TeamError::TeamNotFound(_)));
     }
 }

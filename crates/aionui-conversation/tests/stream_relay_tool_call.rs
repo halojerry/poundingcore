@@ -61,6 +61,9 @@ async fn setup_repo() -> (Arc<SqliteConversationRepository>, aionui_db::Database
         pinned_at: None,
         created_at: now,
         updated_at: now,
+        project_id: None,
+        folder_id: None,
+        name_source: None,
     })
     .await
     .unwrap();
@@ -100,6 +103,7 @@ async fn run_tool_call_with_empty_call_id_is_not_persisted() {
 
     let messages = repo
         .list_messages_page(
+            "system_default_user",
             "conv-1",
             &MessagePageParams {
                 limit: 100,
@@ -157,6 +161,7 @@ async fn run_tool_call_late_running_event_does_not_regress_completed_message() {
 
     let messages = repo
         .list_messages_page(
+            "system_default_user",
             "conv-1",
             &MessagePageParams {
                 limit: 100,
@@ -223,6 +228,7 @@ async fn run_tool_call_canceled_status_persists_as_terminal_finish() {
 
     let messages = repo
         .list_messages_page(
+            "system_default_user",
             "conv-1",
             &MessagePageParams {
                 limit: 100,
@@ -398,6 +404,7 @@ async fn run_agent_turn_with_empty_call_id_tool_call_is_not_persisted() {
 
     let messages = repo
         .list_messages_page(
+            "system_default_user",
             "conv-1",
             &MessagePageParams {
                 limit: 100,

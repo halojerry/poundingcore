@@ -216,6 +216,12 @@ pub enum BackendError {
     CommandNotSupported { command: &'static str },
     #[error("backend transport error: {0}")]
     Transport(String),
+    /// The session workspace (spawn cwd) is missing, not a directory, or not
+    /// accessible. Carried as its own class (not `Transport`) so the app layer
+    /// can keep the legacy #410 workspace-unavailable UX instead of an opaque
+    /// 502; payload = the path.
+    #[error("workspace unavailable: {0}")]
+    WorkspaceUnavailable(String),
     #[error("session not found: {0}")]
     SessionNotFound(String),
     #[error("backend setup/handshake rejected: {0}")]
@@ -227,6 +233,20 @@ pub enum BackendError {
     /// please retry" (503-class) instead of an opaque 500 (bug-hunt codex-500).
     #[error("backend handshake timed out (agent still starting): {0}")]
     HandshakeTimeout(String),
+}
+
+impl BackendError {
+    /// Map a spawn-layer failure into the seam error. The classified
+    /// `WorkspaceUnavailable` passes through as its own class (the app layer
+    /// surfaces the legacy #410 workspace-unavailable UX from it); everything
+    /// else collapses to `Transport` under the caller's context prefix, as
+    /// before.
+    pub(crate) fn from_spawn(context: &'static str, e: aionui_process::ProcessError) -> Self {
+        match e {
+            aionui_process::ProcessError::WorkspaceUnavailable(path) => Self::WorkspaceUnavailable(path),
+            e => Self::Transport(format!("{context}: {e}")),
+        }
+    }
 }
 
 // ==========================================================================
@@ -308,6 +328,20 @@ pub enum SessionSpec {
     Resume {
         session_id: String,
         backend_session_id: Option<String>,
+    },
+    /// Open by forking an EXISTING backend session into a new one: the parent's
+    /// transport id is only the fork SOURCE, never this session's binding. The
+    /// adapter learns its own binding from the backend (codex `thread/started`,
+    /// claude `system/init`) and reports it via `BackendBound`. Used exactly
+    /// once per forked conversation — as soon as a binding is persisted, later
+    /// opens go back to `Resume`.
+    Fork {
+        session_id: String,
+        /// The parent conversation's backend session id (fork source).
+        parent_backend_session_id: String,
+        /// Backend turn to fork at (inclusive); `None` = fork at HEAD. Only
+        /// codex (`thread/fork`'s `lastTurnId`) consumes this today.
+        at_turn_id: Option<String>,
     },
 }
 
@@ -400,5 +434,23 @@ mod tests {
     fn command_names_are_stable() {
         assert_eq!(command_name(&Command::Rewind { num_turns: 2 }), "rewind");
         assert_eq!(command_name(&Command::ListCheckpoints), "list_checkpoints");
+    }
+
+    /// #410 parity: the classified workspace-unavailable spawn failure crosses
+    /// the seam as its own `BackendError` class (path payload intact); every
+    /// other spawn failure collapses to `Transport` under the context prefix.
+    #[test]
+    fn from_spawn_keeps_workspace_unavailable_class() {
+        let err = BackendError::from_spawn(
+            "codex spawn failed",
+            aionui_process::ProcessError::workspace_unavailable("/gone/workspace"),
+        );
+        assert_eq!(err, BackendError::WorkspaceUnavailable("/gone/workspace".into()));
+
+        let err = BackendError::from_spawn("codex spawn failed", aionui_process::ProcessError::internal("boom"));
+        assert_eq!(
+            err,
+            BackendError::Transport("codex spawn failed: internal error: boom".into())
+        );
     }
 }

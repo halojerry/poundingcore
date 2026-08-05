@@ -17,6 +17,33 @@
 /// `AdapterSpecific.payload` is an opaque escape hatch this contract does NOT
 /// promise total equality over; `assert_eq!` only needs `PartialEq`. Deriving
 /// fewer traits than available is always legal ⇒ the shape compiles as-is.
+/// Per-turn token counters for the usage indicator's detail line
+/// ("input · output · cache read · thinking"). Every field is a per-turn total,
+/// NOT a running context figure — `UsageDelta.total_tokens` carries occupancy.
+///
+/// Both direct backends report all of it (live-verified): claude via
+/// `result.usage` plus the `thinking_tokens` summed off each `message_delta`,
+/// codex via `tokenUsage.last`. Backends that report none leave it zeroed, and
+/// the renderer then omits the line entirely.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageBreakdown {
+    /// Cache HITS — tokens read from an existing prefix cache.
+    pub cached_read_tokens: u64,
+    /// Cache WRITES — tokens newly committed to the cache this turn.
+    pub cached_write_tokens: u64,
+    /// Reasoning/thinking tokens, billed as output but rendered separately.
+    pub thought_tokens: u64,
+}
+
+impl UsageBreakdown {
+    /// Whether anything was reported. A fully zeroed breakdown is indistinguishable
+    /// from "this backend tells us nothing", so it is omitted rather than rendered
+    /// as a row of zeros.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)] // +Serialize/Deserialize (Addendum 2a, 007 §C2). only PartialEq — see FIX 4a above
 pub enum SessionEvent {
     // ---- command lower (FIX 2): orchestration lowers Command::Send here ----
@@ -220,22 +247,22 @@ pub enum SessionEvent {
         /// ⚠️ TIO-13: may carry a tool title — never log at info level.
         #[serde(default)]
         metadata: Option<serde_json::Value>,
-        /// AskUserQuestion projection: the raised tool's name, so the conversation
-        /// layer can recognize an `AskUserQuestion` permission and render it as a
-        /// question card (not a generic allow/deny). `None` for every other path
-        /// (ordinary tool approvals, ACP MCP, auth). The reducer NEVER reads it
-        /// (ref-counts on request_id only — §R9). `#[serde(default)]` so older
-        /// persisted frames deserialize as `None`.
+        /// The raised tool's name (claude-direct: every `can_use_tool`), used as
+        /// the permission card's title and to recognize an `AskUserQuestion`
+        /// permission (rendered as a question card, not a generic allow/deny).
+        /// `None` for paths that name no tool (ACP MCP, auth). The reducer NEVER
+        /// reads it (ref-counts on request_id only — §R9). `#[serde(default)]` so
+        /// older persisted frames deserialize as `None`.
         #[serde(default)]
         tool_name: Option<String>,
-        /// AskUserQuestion projection: the raised tool's raw `input`
-        /// (`{questions:[{question, header, options:[{label,description}], multiSelect}]}`).
-        /// This is QUESTION CONTENT meant to be shown to the user — NOT a sensitive
-        /// tool body, so TIO-13's redaction does not apply (`detail` still stays
-        /// `None` for ordinary tools). Carried so the question text/options reach the
-        /// frontend, which cannot synthesize text that exists on no transport. `None`
-        /// for non-AskUserQuestion paths. Reducer no-op. `#[serde(default)]` for
-        /// back-compat.
+        /// The raised tool's raw `input`, shown on the permission card so the
+        /// approver can review WHAT they are approving (a Bash `command`, an
+        /// AskUserQuestion `{questions:[…]}` — AionUi issue #3779: without it the
+        /// card showed only the tool name and the user approved blind). This is
+        /// display-to-the-approver, NOT logging — TIO-13 (never log tool input at
+        /// info) still applies to log output. `None` for paths that carry no tool
+        /// input (auth, codex approvals until their params are probed). Reducer
+        /// no-op. `#[serde(default)]` for back-compat.
         #[serde(default)]
         input: Option<serde_json::Value>,
     },
@@ -269,12 +296,24 @@ pub enum SessionEvent {
     /// Per-turn typed usage/cost (Addendum 5 / U15). Adapter normalizes a
     /// cumulative wire counter to a per-turn DELTA (G6). Reducer no-op (pure
     /// consumer signal). codex `thread/tokenUsage/updated.last`; claude
-    /// `result.usage`; cost_usd may be None.
+    /// `result.usage`; cost_usd may be None. When present, `cost_usd` is the
+    /// SESSION-cumulative spend: claude's wire value (`total_cost_usd`) is only
+    /// process-cumulative, so its conn re-bases it through a cost ledger before
+    /// broadcast (see `claude_conn::CostLedger`).
     UsageDelta {
         input_tokens: u64,
         output_tokens: u64,
         total_tokens: u64,
         cost_usd: Option<f64>,
+        /// Per-turn counters behind the indicator's detail line. Separate from
+        /// `total_tokens`, which is context OCCUPANCY: on claude the two even come
+        /// from different frames (the turn aggregate vs. the last API call).
+        breakdown: UsageBreakdown,
+        /// The model's total context window, when the backend reports one
+        /// (claude `result.modelUsage.<model>.contextWindow`; codex
+        /// `tokenUsage.modelContextWindow`, which is nullable). Renders as the
+        /// denominator of the usage indicator; `None` leaves it a bare counter.
+        context_window: Option<u64>,
     },
 
     /// MCP / tool provisioning as a LIVE event (Addendum 5 / U16). Reducer no-op.
@@ -332,6 +371,18 @@ pub enum SessionEvent {
         label: Option<String>,
         status: SubagentStatus,
         parent_ref: Option<String>,
+        /// Container kind of this roster entry, learned from the spawning wire
+        /// frame (claude `task_started.task_type`; only that frame carries it —
+        /// `task_progress`/`task_updated`/`task_notification` do not, and codex
+        /// collab threads never declare one → `None`). `WorkflowContainer` marks
+        /// the ONE kind whose turn emits multiple `result` frames (launch +
+        /// terminal after completion, fixture invariant 2.1.176/2.1.220), so it
+        /// alone may hold a turn open via the pump's Finish-suppression roster.
+        /// A background bash (`local_bash`) or unknown kind must never suppress:
+        /// its turn gets no later terminal result, so suppression == a wedged
+        /// turn that only the 15s watchdog can end (live 2026-07-30).
+        #[serde(default)]
+        kind: Option<SubagentTaskKind>,
     },
 
     /// 009 R6b / §3 / H1: RICH per-agent workflow detail for the background-plane
@@ -353,6 +404,35 @@ pub enum SessionEvent {
         tokens: Option<u64>,
         tool_calls: Option<u64>,
         last_tool_name: Option<String>,
+        /// Which declared phase this agent belongs to (claude `phaseIndex` /
+        /// `phaseTitle`). Lets a consumer group agents under their phase instead
+        /// of rendering one flat list. Both None on a shape that declares no
+        /// phases.
+        phase_index: Option<u32>,
+        phase_title: Option<String>,
+        /// One-line summary of the agent's last tool call (claude
+        /// `lastToolSummary`) — e.g. the command for a Bash step. Pairs with
+        /// `last_tool_name`.
+        last_tool_summary: Option<String>,
+        /// Wall-clock duration of the agent's run. claude emits it ONLY on the
+        /// terminal (`state: "done"`) entry.
+        duration_ms: Option<u64>,
+    },
+
+    /// One declared phase of a running workflow (claude
+    /// `workflow_progress[].workflow_phase`, `{index, title}`).
+    ///
+    /// Container-level, not per-agent: the whole phase list is declared up front
+    /// on the FIRST `task_progress` frame, so a consumer learns the shape of the
+    /// workflow before most agents have been dispatched. Kept separate from
+    /// `SubagentDetail` (whose subject is an agent) so neither event's fields
+    /// have to be made meaningless for the other. Reducer NO-OP, like
+    /// `SubagentDetail`; only the pump/orchestrator read it.
+    WorkflowPhase {
+        /// The container `task_id` these phases belong to.
+        task_id: String,
+        index: u32,
+        title: String,
     },
 
     /// Out-of-turn diagnostic NOTICE (codex `warning` / `guardianWarning` /
@@ -366,7 +446,15 @@ pub enum SessionEvent {
     /// `{turnId, willRetry}` and is either a transient retry (→ Heartbeat) or the
     /// turn's terminal cause (→ already covered by `turn/completed`). Reducer NO-OP
     /// (an advisory does not move the FSM). Only the conversation layer projects it.
-    Notice { level: NoticeLevel, message: String },
+    Notice {
+        level: NoticeLevel,
+        /// English text, ALWAYS present. It is what the UI shows when
+        /// `localized` is absent or its code has no translation in the active
+        /// locale, so it must stand on its own — never a placeholder.
+        message: String,
+        /// Optional translation handle. `None` renders `message` verbatim.
+        localized: Option<LocalizedText>,
+    },
 
     /// Live tool-OUTPUT delta (codex `item/commandExecution/outputDelta`). The
     /// incremental stdout/stderr of a RUNNING tool, keyed by the owning tool's
@@ -451,6 +539,13 @@ pub enum SessionEvent {
         cost_text: Option<String>,
     },
 
+    /// Agent-generated session title (claude `generate_session_title` reply,
+    /// sniffed off the success control_response; the ACP path never reaches
+    /// this enum — it flows through the legacy bridge's `session_info_update`
+    /// translation). FSM-orthogonal: the reducer no-ops; only the conversation
+    /// layer applies it under the `name_source` guard (spec 2026-08-04).
+    SessionTitle { title: String },
+
     /// Addendum 9 (consumer-driven, conversation Tier-2): the adapter lowers its
     /// current `(session_id → backend_session_id)` binding downstream so the
     /// conversation layer can persist `conversations.backend_session_id` as the
@@ -466,6 +561,17 @@ pub enum SessionEvent {
     /// re-attach, fork, or backend-session loss. `None` = backend session lost /
     /// not yet established.
     BackendBound { backend_session_id: Option<String> },
+
+    /// Fork anchoring (BackendBound's turn-scoped sibling): the adapter lowers
+    /// the backend's OWN id for the turn that just started (codex
+    /// `turn/started` → `Turn.id`) so the conversation layer can stamp it onto
+    /// every message row it persists for that turn. That stamp is what later
+    /// resolves `thread/fork`'s `lastTurnId` when the user forks mid-history —
+    /// the runtime `turn_<shortid>` ids are aionui-minted and mean nothing to
+    /// the backend. Same contract as BackendBound: orchestration-lowered
+    /// pass-through, reducer no-op, never persisted as an event. Only codex
+    /// emits it today; backends without a turn-anchored fork never do.
+    BackendTurnBound { backend_turn_id: String },
 }
 
 // ==========================================================================
@@ -517,6 +623,18 @@ pub enum SubagentKind {
         session_id: String,
     },
     Workflow,
+}
+
+/// Container kind of a `SubagentUpdate` roster entry (see that variant's `kind`
+/// field). Normalized from the claude wire's `task_started.task_type`:
+/// `"local_workflow"` → `WorkflowContainer`, any other declared value (e.g.
+/// `"local_bash"`) → `Other`. Deliberately two-valued: the only consumer is the
+/// pump's suppression-roster admission, which needs exactly the bit "may this
+/// ref hold the turn open".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SubagentTaskKind {
+    WorkflowContainer,
+    Other,
 }
 
 /// 007 §9.17/§6b b3: a `Permission` request's class. Default `Tool` (existing
@@ -651,6 +769,35 @@ pub enum ProvisioningPhase {
 /// `warning` / `guardianWarning` / `configWarning` (something the user should know
 /// but the turn can still proceed); `Info` covers `deprecationNotice` (advisory,
 /// non-urgent). Backend-neutral so a future backend's advisory maps here too.
+/// A message the UI can translate: a stable code plus its interpolation values.
+///
+/// The emitting backend owns the code; the frontend looks it up under
+/// `conversation.agentTip.codes.<code>.body` and falls back to the `Notice`'s
+/// English `message` when the key is missing. Params are whatever that string
+/// interpolates (e.g. `{"count": 2}`), carried as JSON so a backend can add a
+/// placeholder without changing this type.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LocalizedText {
+    pub code: String,
+    #[serde(default)]
+    pub params: serde_json::Map<String, serde_json::Value>,
+}
+
+impl LocalizedText {
+    pub fn new(code: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            params: serde_json::Map::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with(mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+        self.params.insert(key.into(), value.into());
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NoticeLevel {
     Info,
@@ -739,6 +886,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | Snapshot { .. }
         | Lagged { .. }
         | BackendBound { .. }
+        | BackendTurnBound { .. }
         | BackendSuspended => EventClass::OrchestrationLowered,
         // backend-produced (self-describing; PERSISTED — tier decided separately, §7.2)
         MessageDelta { .. }
@@ -759,6 +907,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | CatalogUpdated { .. }
         | SubagentUpdate { .. }
         | SubagentDetail { .. }
+        | WorkflowPhase { .. }
         | Notice { .. }
         | ToolOutputDelta { .. }
         | TurnDiffUpdated { .. }
@@ -766,6 +915,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | ItemCompleted { .. }
         | MessageFinalized(..)
         | SessionInfo { .. }
+        | SessionTitle { .. }
         | CheckpointList { .. } => EventClass::BackendProduced,
     }
 }
@@ -798,7 +948,10 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             CheckpointList { .. } => PersistTier::Ephemeral,                     // query response, not history
             CatalogUpdated { .. } => PersistTier::Ephemeral, // async catalog discovery, re-discovered on open (not history)
             SessionInfo { .. } => PersistTier::Ephemeral, // on-demand query snapshot, re-queryable (not history)
+            SessionTitle { .. } => PersistTier::Ephemeral, // applied to conversations.name by the conversation layer, not history
             SubagentDetail { .. } => PersistTier::Ephemeral, // transient per-agent progress (roster fill, re-derivable)
+            // the phase list is re-declared on the next run's first progress frame
+            WorkflowPhase { .. } => PersistTier::Ephemeral,
             Plan { .. } => PersistTier::Ephemeral, // LC-8a: live to-do snapshot, full-replace + re-derivable (not history)
             ToolCall { .. }
             | ToolResult { .. }
@@ -824,6 +977,7 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             | Snapshot { .. }
             | Lagged { .. }
             | BackendBound { .. }
+            | BackendTurnBound { .. }
             | BackendSuspended => PersistTier::Ephemeral,
         },
     }
@@ -900,7 +1054,8 @@ mod additive_tests {
                 r#ref: "a1".into(),
                 label: None,
                 status: SubagentStatus::Running,
-                parent_ref: None
+                parent_ref: None,
+                kind: None
             }),
             EventClass::BackendProduced
         );
@@ -1005,6 +1160,7 @@ mod additive_tests {
                 SessionEvent::Notice {
                     level: NoticeLevel::Warning,
                     message: "config key X is deprecated".into(),
+                    localized: None,
                 },
                 BackendProduced,
                 Display,
@@ -1060,6 +1216,14 @@ mod additive_tests {
                 Ephemeral,
             ),
             (
+                "SessionTitle",
+                SessionEvent::SessionTitle {
+                    title: "Fix login bug".into(),
+                },
+                BackendProduced,
+                Ephemeral,
+            ),
+            (
                 "SubagentDetail",
                 SessionEvent::SubagentDetail {
                     r#ref: "a".into(),
@@ -1070,6 +1234,10 @@ mod additive_tests {
                     tokens: None,
                     tool_calls: None,
                     last_tool_name: None,
+                    phase_index: None,
+                    phase_title: None,
+                    last_tool_summary: None,
+                    duration_ms: None,
                 },
                 BackendProduced,
                 Ephemeral,
@@ -1123,6 +1291,8 @@ mod additive_tests {
                     output_tokens: 1,
                     total_tokens: 2,
                     cost_usd: None,
+                    context_window: None,
+                    breakdown: Default::default(),
                 },
                 BackendProduced,
                 Display,
@@ -1223,6 +1393,7 @@ mod additive_tests {
                     label: None,
                     status: SubagentStatus::Running,
                     parent_ref: None,
+                    kind: None,
                 },
                 BackendProduced,
                 DisplayAndState,
@@ -1231,13 +1402,14 @@ mod additive_tests {
             ("Rewound", SessionEvent::Rewound { to_turn: 1 }, BackendProduced, State),
         ];
 
-        // Tripwire: every SessionEvent variant must appear. 32 variants today
-        // (7 orchestration-lowered + 25 backend-produced, incl. Notice +
-        // ToolOutputDelta + TurnDiffUpdated + SessionInfo); AdapterSpecific appears
-        // twice for its raw-timing vs structured split → 33 rows. A new variant trips.
+        // Tripwire: every SessionEvent variant must appear. 33 variants today
+        // (7 orchestration-lowered + 26 backend-produced, incl. Notice +
+        // ToolOutputDelta + TurnDiffUpdated + SessionInfo + SessionTitle);
+        // AdapterSpecific appears twice for its raw-timing vs structured split
+        // → 34 rows. A new variant trips.
         assert_eq!(
             table.len(),
-            33,
+            34,
             "every SessionEvent variant (+ the AdapterSpecific timing split) must be routed here"
         );
 
@@ -1275,7 +1447,8 @@ mod additive_tests {
                 r#ref: "a".into(),
                 label: None,
                 status: SubagentStatus::Completed,
-                parent_ref: None
+                parent_ref: None,
+                kind: None
             }),
             PersistTier::DisplayAndState
         );
@@ -1321,6 +1494,7 @@ mod additive_tests {
                 label: None,
                 status: SubagentStatus::Running,
                 parent_ref: None, // top-level boundary
+                kind: None,
             },
             SessionEvent::BackendBound {
                 backend_session_id: None, // lost-binding boundary
@@ -1386,6 +1560,8 @@ mod additive_tests {
                 output_tokens: 50,
                 total_tokens: 150,
                 cost_usd: Some(0.0021),
+                context_window: None,
+                breakdown: Default::default(),
             },
             SessionEvent::Provisioning {
                 phase: ProvisioningPhase::ToolsWaiting,
@@ -1400,10 +1576,12 @@ mod additive_tests {
                 label: Some("reviewer".into()),
                 status: SubagentStatus::Interrupted,
                 parent_ref: Some("wf-root".into()),
+                kind: None,
             },
             SessionEvent::Notice {
                 level: NoticeLevel::Info,
                 message: "deprecated: use --foo".into(),
+                localized: None,
             },
             SessionEvent::ToolOutputDelta {
                 item_id: "call_0".into(),

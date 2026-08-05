@@ -4,9 +4,7 @@ use crate::manager::acp::error_mapping::is_acp_session_not_found;
 use crate::manager::acp::mode_normalize::normalize_requested_mode_for_available_values;
 use crate::protocol::error::AcpError;
 use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId};
-use agent_client_protocol::schema::{
-    SessionId, SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest,
-};
+use agent_client_protocol::schema::v1::{SessionId, SetSessionConfigOptionRequest, SetSessionModeRequest};
 use std::collections::VecDeque;
 use tracing::{debug, error, info, warn};
 
@@ -126,14 +124,7 @@ impl AcpAgentManager {
                 }
 
                 ReconcileAction::SetModel { model } => {
-                    if let Err(e) = self
-                        .protocol
-                        .set_model(SetSessionModelRequest::new(
-                            SessionId::new(session_id),
-                            model.as_str().to_owned(),
-                        ))
-                        .await
-                    {
+                    if let Err(e) = self.protocol.set_model(session_id, model.as_str()).await {
                         if is_acp_session_not_found(&e) {
                             warn!(
                                 conversation_id = %self.params.conversation_id,
@@ -194,7 +185,7 @@ impl AcpAgentManager {
                         .set_config_option(SetSessionConfigOptionRequest::new(
                             SessionId::new(session_id),
                             key.as_str().to_owned(),
-                            resolved_value.clone(),
+                            resolved_value.as_str(),
                         ))
                         .await
                     {

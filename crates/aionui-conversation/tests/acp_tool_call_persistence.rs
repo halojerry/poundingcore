@@ -19,10 +19,11 @@ async fn run_acp_tool_call_update_without_insert_creates_placeholder() {
     let db = init_database_memory().await.unwrap();
     let user_repo = SqliteUserRepository::new(db.pool().clone());
     let user = user_repo.create_user("user-1", "hash").await.unwrap();
+    let user_id = user.id.clone();
     let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
     repo.create(&ConversationRow {
         id: "conv-1".into(),
-        user_id: user.id,
+        user_id: user_id.clone(),
         name: "test".into(),
         r#type: "acp".into(),
         extra: "{}".into(),
@@ -34,6 +35,9 @@ async fn run_acp_tool_call_update_without_insert_creates_placeholder() {
         pinned_at: None,
         created_at: now_ms(),
         updated_at: now_ms(),
+        project_id: None,
+        folder_id: None,
+        name_source: None,
     })
     .await
     .unwrap();
@@ -44,7 +48,7 @@ async fn run_acp_tool_call_update_without_insert_creates_placeholder() {
         "conv-1".into(),
         "asst-1".into(),
         "turn-1".into(),
-        "user-1".into(),
+        user_id.clone(),
         repo.clone(),
         bus,
     );
@@ -72,6 +76,7 @@ async fn run_acp_tool_call_update_without_insert_creates_placeholder() {
 
     let messages = repo
         .list_messages_page(
+            &user_id,
             "conv-1",
             &MessagePageParams {
                 limit: 20,
@@ -93,10 +98,11 @@ async fn run_acp_tool_call_late_initial_event_merges_with_update_placeholder() {
     let db = init_database_memory().await.unwrap();
     let user_repo = SqliteUserRepository::new(db.pool().clone());
     let user = user_repo.create_user("user-1", "hash").await.unwrap();
+    let user_id = user.id.clone();
     let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
     repo.create(&ConversationRow {
         id: "conv-1".into(),
-        user_id: user.id,
+        user_id: user_id.clone(),
         name: "test".into(),
         r#type: "acp".into(),
         extra: "{}".into(),
@@ -108,6 +114,9 @@ async fn run_acp_tool_call_late_initial_event_merges_with_update_placeholder() {
         pinned_at: None,
         created_at: now_ms(),
         updated_at: now_ms(),
+        project_id: None,
+        folder_id: None,
+        name_source: None,
     })
     .await
     .unwrap();
@@ -118,7 +127,7 @@ async fn run_acp_tool_call_late_initial_event_merges_with_update_placeholder() {
         "conv-1".into(),
         "asst-1".into(),
         "turn-1".into(),
-        "user-1".into(),
+        user_id.clone(),
         repo.clone(),
         bus,
     );
@@ -162,6 +171,7 @@ async fn run_acp_tool_call_late_initial_event_merges_with_update_placeholder() {
 
     let messages = repo
         .list_messages_page(
+            &user_id,
             "conv-1",
             &MessagePageParams {
                 limit: 20,

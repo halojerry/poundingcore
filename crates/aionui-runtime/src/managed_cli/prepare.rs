@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::managed_cli::{cli_version, current_runtime_key};
+use crate::managed_resources;
 use crate::managed_resources_contract::ManagedCliResourceContract;
 use crate::node_runtime::ensure_node_runtime;
 use crate::spawn::Builder;
@@ -32,6 +33,7 @@ impl ManagedCliError {
 fn npm_package(name: &str) -> Option<&'static str> {
     match name {
         "claude" => Some("@anthropic-ai/claude-code"),
+        "codex" => Some("@openai/codex"),
         _ => None,
     }
 }
@@ -156,6 +158,30 @@ pub async fn prepare_managed_cli_to_root(name: &str, out_root: &Path) -> Result<
             set_executable(&dst)?;
             (format!("claude{}", exe_suffix()), Vec::new())
         }
+        "codex" => {
+            let pkg = find_platform_package(&node_modules, "@openai", "codex-")?;
+            let src_vendor = pkg.join("vendor");
+            if !src_vendor.is_dir() {
+                return Err(ManagedCliError::new(format!(
+                    "codex vendor dir missing at {}",
+                    src_vendor.display()
+                )));
+            }
+            managed_resources::materialize_directory(&src_vendor, &cli_root.join("vendor"))
+                .map_err(ManagedCliError::io)?;
+            // Locate the vendor triple dir (e.g. vendor/aarch64-apple-darwin).
+            let triple = first_subdir_name(&cli_root.join("vendor"))?;
+            let exe = format!("vendor/{triple}/bin/codex{}", exe_suffix());
+            let exe_abs = cli_root.join(&exe);
+            if !exe_abs.is_file() {
+                return Err(ManagedCliError::new(format!(
+                    "codex binary missing at {}",
+                    exe_abs.display()
+                )));
+            }
+            set_executable(&exe_abs)?;
+            (exe, vec![format!("vendor/{triple}")])
+        }
         _ => return Err(ManagedCliError::new(format!("unknown CLI {name}"))),
     };
 
@@ -210,6 +236,17 @@ fn find_platform_package(node_modules: &Path, scope: &str, prefix: &str) -> Resu
     )))
 }
 
+fn first_subdir_name(dir: &Path) -> Result<String, ManagedCliError> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|error| ManagedCliError::new(format!("read {}: {error}", dir.display())))?;
+    for entry in entries.flatten() {
+        if entry.path().is_dir() {
+            return Ok(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Err(ManagedCliError::new(format!("no subdirectory under {}", dir.display())))
+}
+
 #[cfg(unix)]
 fn set_executable(path: &Path) -> Result<(), ManagedCliError> {
     use std::os::unix::fs::PermissionsExt;
@@ -230,6 +267,8 @@ mod tests {
     #[test]
     fn npm_package_and_os_cpu_map_known_clis() {
         assert_eq!(npm_package("claude"), Some("@anthropic-ai/claude-code"));
+        assert_eq!(npm_package("codex"), Some("@openai/codex"));
+        assert_eq!(npm_package("gemini"), None);
         assert!(npm_os_cpu().is_some());
     }
 

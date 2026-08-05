@@ -408,13 +408,22 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
         // SessionInfo is a read-only query reply (context budget / cost) — never a
         // turn signal. The conversation projects it; FSM no-op.
         | SessionEvent::SessionInfo { .. }
+        // SessionTitle is an agent-generated conversation title — applied by the
+        // conversation layer under the name_source guard. Never a turn signal.
+        | SessionEvent::SessionTitle { .. }
         // 009 R6b: SubagentDetail is the rich BACKGROUND-plane roster fill — read
         // ONLY by the orchestrator's workflow_roster, never by the FSM. No-op here.
         | SessionEvent::SubagentDetail { .. }
+        // WorkflowPhase is the container's declared phase list — display grouping
+        // only, same background plane as SubagentDetail. Never a turn signal.
+        | SessionEvent::WorkflowPhase { .. }
         // Addendum 9: BackendBound is a pure pass-through for the conversation
         // (persist backend_session_id). The reducer NEVER touches SessionState for
         // it — it is not a turn signal, not a requires-action, not a roster update.
         | SessionEvent::BackendBound { .. }
+        // BackendTurnBound is BackendBound's turn-scoped sibling (fork anchor
+        // pass-through for message stamping). Same contract: reducer no-op.
+        | SessionEvent::BackendTurnBound { .. }
         // 009 R6: BackendSuspended is FSM-invisible (the wake re-spawns on the
         // same event_tx). The orchestrator clears the roster on it; the reducer
         // does NOT move SessionState (suspend ≠ a turn boundary).
@@ -434,6 +443,9 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
             label,
             status,
             parent_ref,
+            // Container kind is a pump-side (suppression-roster) concern; the
+            // reducer's display roster tracks every subagent regardless of kind.
+            kind: _,
         } => {
             let mut to = state.clone();
             if let SessionState::Running { subagents, .. } = &mut to {
@@ -1032,6 +1044,8 @@ mod tests {
                 output_tokens: 1,
                 total_tokens: 2,
                 cost_usd: Some(0.5),
+                context_window: None,
+                breakdown: Default::default(),
             },
             // use the payload-carrying phase (stronger than the proptest's nullary ToolsReady)
             SessionEvent::Provisioning {
@@ -1052,6 +1066,7 @@ mod tests {
             SessionEvent::Notice {
                 level: crate::event::NoticeLevel::Warning,
                 message: "advisory".into(),
+                localized: None,
             },
             SessionEvent::ItemStarted {
                 item_id: "i".into(),
@@ -1099,6 +1114,10 @@ mod tests {
                 tokens: None,
                 tool_calls: None,
                 last_tool_name: None,
+                phase_index: None,
+                phase_title: None,
+                last_tool_summary: None,
+                duration_ms: None,
             },
             SessionEvent::BackendSuspended,
         ];
@@ -1179,6 +1198,8 @@ mod tests {
                 output_tokens: 1,
                 total_tokens: 2,
                 cost_usd: None,
+                context_window: None,
+                breakdown: Default::default(),
             },
             SessionEvent::Provisioning {
                 phase: ProvisioningPhase::ToolsWaiting,
@@ -1198,6 +1219,10 @@ mod tests {
                 tokens: None,
                 tool_calls: None,
                 last_tool_name: None,
+                phase_index: None,
+                phase_title: None,
+                last_tool_summary: None,
+                duration_ms: None,
             },
             SessionEvent::ToolOutputDelta {
                 item_id: "call_0".into(),
@@ -1209,6 +1234,7 @@ mod tests {
             SessionEvent::Notice {
                 level: crate::event::NoticeLevel::Warning,
                 message: "advisory".into(),
+                localized: None,
             },
             SessionEvent::ItemStarted {
                 item_id: "i".into(),
@@ -1787,6 +1813,7 @@ mod tests {
             label: None,
             status,
             parent_ref: parent.map(Into::into),
+            kind: None,
         }
     }
 
@@ -2179,6 +2206,8 @@ mod proptest_totality {
                 output_tokens: 1,
                 total_tokens: 2,
                 cost_usd: None,
+                context_window: None,
+                breakdown: Default::default(),
             }),
             Just(SessionEvent::Provisioning {
                 phase: ProvisioningPhase::ToolsReady
@@ -2193,6 +2222,7 @@ mod proptest_totality {
                 label: None,
                 status,
                 parent_ref: None,
+                kind: None,
             }),
             Just(SessionEvent::ItemStarted {
                 item_id: "i".into(),
@@ -2230,6 +2260,10 @@ mod proptest_totality {
                 tokens: None,
                 tool_calls: None,
                 last_tool_name: None,
+                phase_index: None,
+                phase_title: None,
+                last_tool_summary: None,
+                duration_ms: None,
             }),
             // newer additive no-op signals — keep the no-panic/determinism sweep
             // touching them too.
@@ -2243,6 +2277,7 @@ mod proptest_totality {
             Just(SessionEvent::Notice {
                 level: crate::event::NoticeLevel::Warning,
                 message: "advisory".into(),
+                localized: None,
             }),
             Just(SessionEvent::SessionInfo {
                 context_usage: None,
