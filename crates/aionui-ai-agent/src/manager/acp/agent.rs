@@ -492,7 +492,6 @@ fn mark_session_opened_after_protocol_ready(
 /// (Claude, Qwen, CodeBuddy, Codex, etc.). Communication now happens via
 /// the `agent-client-protocol` SDK's JSON-RPC transport, replacing the
 /// previous hand-crafted JSON-over-stdin/stdout approach.
-
 /// Result of applying cron's full-auto required-runtime-mode (a-pure) for a
 /// metadata-bearing ACP agent. `Applied` set the backend-native YOLO id;
 /// `Skipped` left the session's already-resolved mode untouched because the
@@ -1871,7 +1870,7 @@ mod tests {
     use crate::manager::acp::config_options::ConfigSnapshot;
     use crate::manager::acp::{AcpAgentManager, AcpSession};
     use crate::protocol::error::{AcpError, CloseReason};
-    use crate::shared_kernel::{ConfigKey, ConfigValue, ModeId, SessionId as DomainSessionId};
+    use crate::shared_kernel::{ModeId, SessionId as DomainSessionId};
     use agent_client_protocol::schema::v1::{
         AvailableCommand, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
     };

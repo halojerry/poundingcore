@@ -71,7 +71,9 @@ check_exists "cc_switch paths" "$ROOT/crates/aionui-ai-agent/src/cc_switch/paths
 check_exists "cc_switch provider_env" "$ROOT/crates/aionui-ai-agent/src/cc_switch/provider_env.rs"
 
 # ---- Builtin Skills ----
-check_exists "pounding-ozon skill bundle" "$ROOT/crates/aionui-app/assets/builtin-skills/pounding-ozon-assistant/SKILL.md"
+# The builtin Ozon skill bundle was renamed from pounding-ozon-assistant to
+# pounding-ozon-probe (PR #4, Aug 2026); the probe bundle is the canonical one.
+check_exists "pounding-ozon skill bundle" "$ROOT/crates/aionui-app/assets/builtin-skills/pounding-ozon-probe/SKILL.md"
 
 # ---- Brand Logo Asset ----
 check_exists "pounding heart logo" "$ROOT/crates/aionui-assets/assets/logos/brand/pounding-heart-solid.png"

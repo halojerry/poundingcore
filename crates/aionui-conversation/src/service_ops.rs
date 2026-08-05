@@ -195,8 +195,11 @@ impl ConversationService {
                     option_id,
                     value = %req.value,
                     error = %ErrorChain(&err),
-                    "Set config option skipped because active agent task is unavailable"
+                    "Set config option skipped because active agent task is unavailable; evicting task"
                 );
+                self.task_manager()
+                    .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
+                    .await;
                 return Err(ConversationError::from(err));
             }
             Err(err) => return Err(ConversationError::from(err)),

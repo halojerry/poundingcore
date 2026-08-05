@@ -1020,6 +1020,16 @@ mod tests {
     async fn acp_unassigned_session_runtime_is_startup_seed_not_resume_snapshot() {
         let repos = setup().await;
         upsert_builtin(&repos, "builtin-hermes-test", "hermes").await;
+        let row = row(
+            "acp",
+            serde_json::json!({
+                "backend": "claude",
+                "current_mode_id": "full-access",
+                "current_model_id": "gpt-5.5"
+            }),
+            None,
+        );
+        repos.insert_conversation(&row).await;
         repos
             .acp_session_repo
             .create(&CreateAcpSessionParams {
@@ -1057,6 +1067,8 @@ mod tests {
         let repos = setup().await;
         upsert_builtin(&repos, "builtin-claude-test", "claude").await;
         upsert_builtin(&repos, "builtin-hermes-test", "hermes").await;
+        let row = row("acp", serde_json::json!({ "backend": "claude" }), None);
+        repos.insert_conversation(&row).await;
         repos
             .acp_session_repo
             .create(&CreateAcpSessionParams {

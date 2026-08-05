@@ -60,7 +60,7 @@ impl IWorkerTaskManager for NoopTaskManager {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         Box::pin(std::future::ready(()))
     }
-    async fn clear(&self) {}
+    fn clear(&self) {}
     fn active_count(&self) -> usize {
         0
     }

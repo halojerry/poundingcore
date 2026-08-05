@@ -3191,30 +3191,14 @@ impl IMockAgent for MockAgent {
         })
     }
 
-    // POUNDING redirects both the dedicated `set_mode` endpoint and
-    // `set_config_option("mode", ...)` to `task.set_mode()`. The mock must
-    // model a mode-capable agent (like the real ACP task) rather than fall
-    // back to the erroring trait default, otherwise every mode switch fails.
-    async fn set_mode(&self, mode: &str) -> Result<(), AgentError> {
-        *self.mode.lock().unwrap() = mode.to_owned();
-        Ok(())
-    }
-
+    // POUNDING routes both the dedicated `set_mode` endpoint and
+    // `set_config_option("mode", ...)` to the config-option chokepoint, so the
+    // mock models mode/model via `set_config_option` (below) rather than the
+    // pre-sync dedicated `set_mode`/`set_model` trait hooks, which upstream
+    // removed from `IMockAgent`.
     async fn get_model(&self) -> Result<GetModelInfoResponse, AgentError> {
         let current = self.model_id.lock().unwrap().clone();
         Ok(Self::build_model_response(&current))
-    }
-
-    async fn set_model(&self, model_id: &str) -> Result<(), AgentError> {
-        if !self.keep_reported_model_on_set {
-            *self.model_id.lock().unwrap() = model_id.to_owned();
-        }
-        Ok(())
-    }
-
-    async fn set_model_confirmed(&self, model_id: &str) -> Result<GetModelInfoResponse, AgentError> {
-        self.set_model(model_id).await?;
-        Ok(Self::build_model_response(model_id))
     }
 
     async fn get_config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
@@ -3230,6 +3214,9 @@ impl IMockAgent for MockAgent {
             .push((option_id.to_owned(), value.to_owned()));
         if option_id == "mode" {
             *self.mode.lock().unwrap() = value.to_owned();
+        }
+        if option_id == "model" && !self.keep_reported_model_on_set {
+            *self.model_id.lock().unwrap() = value.to_owned();
         }
         if let Some(error) = self.set_config_option_error.lock().unwrap().take() {
             return Err(error);
@@ -4332,6 +4319,7 @@ async fn set_model_returns_confirmed_model_from_active_agent() {
 
     let response = svc
         .set_model(
+            "user_1",
             &conv.id,
             SetModelRequest {
                 model_id: "model-b".to_owned(),
@@ -4356,6 +4344,7 @@ async fn set_model_returns_confirmed_model_even_if_get_model_is_stale() {
 
     let response = svc
         .set_model(
+            "user_1",
             &conv.id,
             SetModelRequest {
                 model_id: "model-b".to_owned(),
@@ -4606,6 +4595,7 @@ async fn set_model_updates_assistant_preference_only_when_snapshot_model_mode_is
 
     let response = svc
         .set_model(
+            "user_1",
             &auto_conv.id,
             SetModelRequest {
                 model_id: "model-b".to_owned(),
@@ -4623,7 +4613,11 @@ async fn set_model_updates_assistant_preference_only_when_snapshot_model_mode_is
     );
     let auto_pref = preference_repo.get("asstdef_model_auto").await.unwrap().unwrap();
     assert_eq!(auto_pref.last_model_id.as_deref(), Some("model-b"));
-    let auto_snapshot = repo.get_assistant_snapshot(&auto_conv.id).await.unwrap().unwrap();
+    let auto_snapshot = repo
+        .get_assistant_snapshot("user_1", &auto_conv.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(auto_snapshot.resolved_model_id.as_deref(), Some("model-b"));
 
     upsert_test_assistant_definition(
@@ -4667,6 +4661,7 @@ async fn set_model_updates_assistant_preference_only_when_snapshot_model_mode_is
 
     let _ = svc
         .set_model(
+            "user_1",
             &fixed_conv.id,
             SetModelRequest {
                 model_id: "model-c".to_owned(),
@@ -4677,7 +4672,11 @@ async fn set_model_updates_assistant_preference_only_when_snapshot_model_mode_is
 
     let fixed_pref = preference_repo.get("asstdef_model_fixed").await.unwrap().unwrap();
     assert_eq!(fixed_pref.last_model_id.as_deref(), Some("legacy-fixed-model"));
-    let fixed_snapshot = repo.get_assistant_snapshot(&fixed_conv.id).await.unwrap().unwrap();
+    let fixed_snapshot = repo
+        .get_assistant_snapshot("user_1", &fixed_conv.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(fixed_snapshot.resolved_model_id.as_deref(), Some("model-c"));
 }
 
@@ -4707,15 +4706,18 @@ async fn set_mode_updates_assistant_preference_only_when_snapshot_permission_mod
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_mode_auto",
-            last_model_id: None,
-            last_permission_value: Some("legacy-mode"),
-            last_thought_level_value: None,
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_mode_auto",
+                last_model_id: None,
+                last_permission_value: Some("legacy-mode"),
+                last_thought_level_value: None,
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -4728,6 +4730,7 @@ async fn set_mode_updates_assistant_preference_only_when_snapshot_permission_mod
 
     let response = svc
         .set_mode(
+            "user_1",
             &auto_conv.id,
             SetModeRequest {
                 mode: "plan".to_owned(),
@@ -4737,9 +4740,17 @@ async fn set_mode_updates_assistant_preference_only_when_snapshot_permission_mod
         .unwrap();
 
     assert_eq!(response.mode, "plan");
-    let auto_pref = preference_repo.get("asstdef_mode_auto").await.unwrap().unwrap();
+    let auto_pref = preference_repo
+        .get_for_user("user_1", "asstdef_mode_auto")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(auto_pref.last_permission_value.as_deref(), Some("plan"));
-    let auto_snapshot = repo.get_assistant_snapshot(&auto_conv.id).await.unwrap().unwrap();
+    let auto_snapshot = repo
+        .get_assistant_snapshot("user_1", &auto_conv.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(auto_snapshot.resolved_permission_value.as_deref(), Some("plan"));
 
     upsert_test_assistant_definition(
@@ -4762,15 +4773,18 @@ async fn set_mode_updates_assistant_preference_only_when_snapshot_permission_mod
         .await
         .unwrap();
     preference_repo
-        .upsert(&UpsertAssistantPreferenceParams {
-            assistant_definition_id: "asstdef_mode_fixed",
-            last_model_id: None,
-            last_permission_value: Some("legacy-fixed-mode"),
-            last_thought_level_value: None,
-            last_skill_ids: "[]",
-            last_disabled_builtin_skill_ids: "[]",
-            last_mcp_ids: "[]",
-        })
+        .upsert_for_user(
+            "user_1",
+            &UpsertAssistantPreferenceParams {
+                assistant_definition_id: "asstdef_mode_fixed",
+                last_model_id: None,
+                last_permission_value: Some("legacy-fixed-mode"),
+                last_thought_level_value: None,
+                last_skill_ids: "[]",
+                last_disabled_builtin_skill_ids: "[]",
+                last_mcp_ids: "[]",
+            },
+        )
         .await
         .unwrap();
 
@@ -4783,6 +4797,7 @@ async fn set_mode_updates_assistant_preference_only_when_snapshot_permission_mod
 
     let _ = svc
         .set_mode(
+            "user_1",
             &fixed_conv.id,
             SetModeRequest {
                 mode: "acceptEdits".to_owned(),
@@ -4791,9 +4806,17 @@ async fn set_mode_updates_assistant_preference_only_when_snapshot_permission_mod
         .await
         .unwrap();
 
-    let fixed_pref = preference_repo.get("asstdef_mode_fixed").await.unwrap().unwrap();
+    let fixed_pref = preference_repo
+        .get_for_user("user_1", "asstdef_mode_fixed")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(fixed_pref.last_permission_value.as_deref(), Some("legacy-fixed-mode"));
-    let fixed_snapshot = repo.get_assistant_snapshot(&fixed_conv.id).await.unwrap().unwrap();
+    let fixed_snapshot = repo
+        .get_assistant_snapshot("user_1", &fixed_conv.id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(fixed_snapshot.resolved_permission_value.as_deref(), Some("acceptEdits"));
 }
 

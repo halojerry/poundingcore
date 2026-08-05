@@ -3454,9 +3454,6 @@ mod tests {
         async fn delete_for_user(&self, _user_id: &str, _conversation_id: &str) -> Result<bool, aionui_db::DbError> {
             Ok(false)
         }
-        async fn delete_for_user(&self, _user_id: &str, _conversation_id: &str) -> Result<bool, aionui_db::DbError> {
-            Ok(false)
-        }
         async fn load_runtime_state_for_user(
             &self,
             _user_id: &str,
