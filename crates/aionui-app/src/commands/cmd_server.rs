@@ -20,7 +20,6 @@ use crate::bootstrap::{BootstrapError, BootstrapErrorCode, ParentExitSignal, Ser
 const LISTENING_EVENT_PREFIX: &str = "POUNDINGCORE_LISTENING";
 // Bare, payload-less readiness marker emitted once `axum::serve` actually begins
 // serving. The port is already known from the earlier POUNDINGCORE_LISTENING line,
-// 
 // so this marker only signals the "now serving" edge. POUNDING treats it as the
 // authoritative ready signal, eliminating the "listening early, serving late"
 // false gap.
