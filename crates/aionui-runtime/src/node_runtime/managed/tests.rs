@@ -249,7 +249,7 @@ fn managed_runtime_support_reports_current_platform() {
 #[test]
 fn classify_error_detects_bundled_node_runtime_missing() {
     let err = NodeRuntimeError::managed_invalid(
-        "bundled Node runtime missing under C:\\Program Files\\AionUi\\resources\\bundled-aioncore\\win32-x64\\managed-resources\\node\\node-v24.11.0-win-x64",
+        "bundled Node runtime missing under C:\\Program Files\\AionUi\\resources\\bundled-poundingcore\\win32-x64\\managed-resources\\node\\node-v24.11.0-win-x64",
     );
     let (kind, status) = classify_error(&err);
 

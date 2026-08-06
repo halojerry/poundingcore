@@ -643,6 +643,10 @@ async fn set_system_user_credentials_handler(
 }
 
 // ── POST /api/auth/internal/users/sync-credentials ─────────────────
+// POUNDING login chain: the desktop NewApi login flow syncs the POUNDING
+// API account credentials into the local system user so the bundled WebUI
+// accepts the same username/password. Plaintext password is bcrypt-hashed
+// here (never stored as-is).
 
 #[derive(Debug, Deserialize)]
 struct SyncCredentialsRequest {
