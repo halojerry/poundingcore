@@ -268,7 +268,7 @@ pub async fn build_module_states(
         std::env::current_exe()
             .ok()
             .and_then(|p| p.canonicalize().ok())
-            .unwrap_or_else(|| std::path::PathBuf::from("aioncore")),
+            .unwrap_or_else(|| std::path::PathBuf::from("poundingcore")),
     );
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),

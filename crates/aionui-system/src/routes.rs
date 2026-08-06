@@ -62,6 +62,8 @@ impl From<SystemError> for ApiError {
 /// - `PATCH /api/settings`                   — partial update backend settings
 /// - `GET  /api/settings/client`             — get client preferences
 /// - `PUT  /api/settings/client`             — batch update client preferences
+/// - `GET  /api/settings/managed-runtime`    — get managed runtime state (account + CLI model prefs)
+/// - `PUT  /api/settings/managed-runtime`    — persist managed runtime state
 /// - `GET  /api/providers`                   — list all providers
 /// - `POST /api/providers`                   — create a provider
 /// - `PUT  /api/providers/:id`               — update a provider
